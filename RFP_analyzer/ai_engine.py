@@ -33,6 +33,15 @@ def _extract_retry_delay(error: ResourceExhausted) -> float:
         return float(match.group(1))
     return DEFAULT_BACKOFF_SECONDS
 
+
+def _is_daily_quota_error(error: ResourceExhausted) -> bool:
+    """
+    Gemini's free tier has both short rate limits (retryable) and a hard
+    PerDay-PerProject-PerModel cap (NOT retryable - it only resets daily).
+    Retrying a daily cap is pointless and just makes the app hang.
+    """
+    return "PerDay" in str(error)
+
 # JSON schema description handed to the model so output is predictable
 SCHEMA_HINT = """
 Return ONLY a single valid JSON object (no markdown fences, no commentary) with
@@ -113,16 +122,38 @@ profile provided below — never invent facts that aren't supported by either.
 """
 
 
-def analyze_rfp(rfp_text: str, company_profile: str, on_retry=None) -> dict:
+def analyze_rfp(rfp_text: str, company_profile: str, on_retry=None, num_documents: int = 1) -> dict:
     """
-    Calls Gemini with retry/backoff for transient errors (rate limits, 503s).
-    `on_retry(attempt, wait_seconds, reason)` is an optional callback so the UI
-    can show "retrying in Ns..." instead of just hanging.
+    Analyzes one OR MORE RFPs (already concatenated into rfp_text) against the
+    company profile and returns a SINGLE unified structured result.
+
+    When num_documents > 1 the prompt explicitly instructs Gemini to treat all
+    documents as one combined opportunity and produce ONE merged output.
     """
+    if num_documents > 1:
+        multi_doc_instruction = f"""
+IMPORTANT: The RFP DOCUMENTS section below contains {num_documents} separate RFP
+documents concatenated together. Each is separated by a header line like:
+  "DOCUMENT N OF {num_documents}: filename.pdf"
+
+Analyse ALL of them AS ONE COMBINED OPPORTUNITY and produce a SINGLE unified output:
+- ONE deliverables list merging requirements across all documents (deduplicate)
+- ONE compliance checklist covering all documents combined
+- ONE fit_score and ONE verdict for the company's ability to meet ALL requirements
+- ONE headline_summary covering the overall combined picture
+- For dates/budget: use the earliest deadline; note any range in project_timeline
+Do NOT produce separate results per document. Everything must be merged into one.
+"""
+    else:
+        multi_doc_instruction = ""
+
+    num_label = f"{num_documents} files combined" if num_documents > 1 else "1 file"
+    doc_header = "RFP DOCUMENTS" if num_documents > 1 else "RFP DOCUMENT"
+
     prompt = f"""
 You are a senior RFP/proposal analyst producing a pre-bid "Go/No-Go" case file.
 Compare the RFP requirements below against the company's profile to assess fit.
-
+{multi_doc_instruction}
 {SCHEMA_HINT}
 
 ---
@@ -130,7 +161,7 @@ COMPANY PROFILE (the vendor considering bidding):
 {company_profile}
 
 ---
-RFP DOCUMENT:
+{doc_header} ({num_label}):
 {rfp_text}
 """
     last_error = None
@@ -145,12 +176,22 @@ RFP DOCUMENT:
 
         except ResourceExhausted as e:
             last_error = e
+            if _is_daily_quota_error(e):
+                # This is a hard daily cap - waiting 15-60s will never help, so don't pretend to retry.
+                raise RfpAnalysisError(
+                    "This API key's project has hit Gemini's **free-tier daily quota** "
+                    "(20 requests/day for gemini-2.5-flash). This resets once a day - it is "
+                    "NOT a short rate limit, so retrying right now won't help.\n\n"
+                    "Note: generating a new API key inside the same Google AI Studio account "
+                    "usually does **not** give you a fresh quota - it's tied to the underlying "
+                    "Google Cloud project, not the key itself. To actually get more requests "
+                    "today, either enable billing on that project (moves you off the free tier), "
+                    "or create the key under a genuinely separate Google Cloud project."
+                ) from e
             if attempt == MAX_RETRIES:
                 raise RfpAnalysisError(
-                    "Gemini's free-tier rate limit was hit and retries were exhausted. "
-                    "This API key/project has used up its quota for now — wait a bit and "
-                    "try again, switch to a different API key/project, or enable billing "
-                    "on the Google Cloud project for higher limits."
+                    "Gemini's short-term rate limit was hit and retries were exhausted. "
+                    "Wait a minute and try again."
                 ) from e
             wait_seconds = _extract_retry_delay(e)
             if on_retry:

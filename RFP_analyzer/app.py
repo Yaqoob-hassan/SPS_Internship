@@ -1,6 +1,9 @@
+import json
 import streamlit as st
 from pdf_reader import extract_text_from_pdf
 from ai_engine import analyze_rfp, RfpAnalysisError
+from pdf_report import generate_pdf_report, generate_deliverables_pdf
+from history import save_analysis, list_history, load_analysis
 
 st.set_page_config(page_title="RFP Intelligence — Go/No-Go Analyzer", page_icon="📄", layout="wide")
 
@@ -32,51 +35,136 @@ Standard payment terms accepted: Net 30 (City may require Net 45)
 # ---------- session state ----------
 if "ready" not in st.session_state:
     st.session_state.ready = False
-if "fname" not in st.session_state:
-    st.session_state.fname = None
 if "result" not in st.session_state:
-    st.session_state.result = None
+    st.session_state.result = None      # single combined analysis dict
+if "combined_label" not in st.session_state:
+    st.session_state.combined_label = ""  # display name for the combined run
+if "history_id" not in st.session_state:
+    st.session_state.history_id = None    # unique id of the currently-shown result
+if "loaded_from_history" not in st.session_state:
+    st.session_state.loaded_from_history = False
 
-# ---------- sidebar: company profile ----------
+# ---------- sidebar ----------
 with st.sidebar:
     st.header("🏢 Company Profile")
-    st.caption("This is compared against the RFP to compute fit score and compliance gaps.")
-    company_profile = st.text_area("Edit your company profile", value=DEFAULT_PROFILE, height=420)
+    st.caption("This is compared against the uploaded RFPs to compute fit score and compliance gaps.")
+    company_profile = st.text_area("Edit your company profile", value=DEFAULT_PROFILE, height=300)
+
+    st.divider()
+    st.header("🔎 Load Saved Analysis")
+    st.caption("Search by ID or filename — loads instantly from disk, no AI call.")
+
+    history_records = list_history()
+
+    if history_records:
+        options = ["— New analysis —"] + [r["id"] for r in history_records]
+        labels = {
+            r["id"]: f"{r['id']}  ·  {r['fname']}  ·  {r.get('verdict', '?')} ({r.get('fit_score', '?')})"
+            for r in history_records
+        }
+
+        def _fmt(option_id):
+            return "— New analysis —" if option_id == "— New analysis —" else labels.get(option_id, option_id)
+
+        chosen_id = st.selectbox(
+            "Type to search saved analyses by ID or filename",
+            options=options,
+            format_func=_fmt,
+            index=0,
+            key="history_select",
+        )
+
+        if chosen_id != "— New analysis —" and chosen_id != st.session_state.history_id:
+            record = load_analysis(chosen_id)
+            st.session_state.result = record["result"]
+            st.session_state.combined_label = record.get("fname", chosen_id)
+            st.session_state.history_id = chosen_id
+            st.session_state.loaded_from_history = True
+            st.session_state.ready = False
+            st.rerun()
+    else:
+        st.caption("No saved analyses yet — run one below and it will appear here.")
 
 # ---------- main ----------
 st.title("📄 RFP Intelligence — Go/No-Go Analyzer")
-st.write("Upload an RFP and get an automated pre-bid case file: fit score, deliverables, evaluation criteria, and a department-by-department compliance checklist.")
+st.write(
+    "Upload one or more RFPs. All documents are combined and analysed together, "
+    "producing a single unified deliverable list, compliance checklist, and Go/No-Go verdict."
+)
 
-uploaded_file = st.file_uploader("Upload your RFP (PDF only)", type=["pdf"])
+uploaded_files = st.file_uploader(
+    "Upload RFPs (PDF only — upload as many as you like)",
+    type=["pdf"],
+    accept_multiple_files=True,
+)
 
-if uploaded_file is not None:
-    st.success(f"File uploaded: {uploaded_file.name}")
+if uploaded_files:
+    st.success(
+        f"{len(uploaded_files)} file(s) ready: " + ", ".join(f.name for f in uploaded_files)
+    )
 
-if st.button("Analyze RFP", type="primary"):
-    if uploaded_file is None:
-        st.error("Please upload a PDF file first.")
+if st.button("Analyze", type="primary"):
+    if not uploaded_files:
+        st.error("Please upload at least one PDF file.")
     else:
         st.session_state.ready = True
-        st.session_state.fname = uploaded_file.name
+        st.session_state.loaded_from_history = False
+        st.session_state.history_id = None
         st.rerun()
 
+# ---------- pipeline ----------
 if st.session_state.ready:
     st.session_state.ready = False
+    st.session_state.result = None
 
-    with st.spinner("Reading PDF..."):
+    # ── Step 1: extract text from every uploaded PDF ──────────────────────
+    progress = st.progress(0.0, text="Reading PDFs...")
+    total = len(uploaded_files)
+    combined_parts = []   # list of strings, one per PDF
+    failures = []
+
+    for idx, f in enumerate(uploaded_files, start=1):
+        progress.progress((idx - 1) / total, text=f"Reading {f.name} ({idx}/{total})...")
         try:
-            rfp_text = extract_text_from_pdf(uploaded_file)
+            text = extract_text_from_pdf(f)
         except Exception as e:
-            st.error(f"Failed to read PDF: {e}")
-            st.stop()
+            failures.append((f.name, f"Failed to read PDF: {e}"))
+            continue
 
-    if not rfp_text.strip():
-        st.error("No text found. This PDF may be a scanned image.")
+        if not text.strip():
+            failures.append((f.name, "No text found — this PDF may be a scanned image."))
+            continue
+
+        # wrap each document with a clear separator so the AI knows which
+        # document each section of text came from
+        combined_parts.append(
+            f"{'=' * 60}\n"
+            f"DOCUMENT {idx} OF {total}: {f.name}\n"
+            f"{'=' * 60}\n"
+            f"{text.strip()}"
+        )
+
+    progress.progress(1.0, text="All PDFs read.")
+
+    if failures:
+        with st.expander(f"⚠️ {len(failures)} file(s) could not be read", expanded=True):
+            for fname, msg in failures:
+                st.error(f"**{fname}**: {msg}")
+
+    if not combined_parts:
+        st.error("No readable text was found in any of the uploaded files. Cannot proceed.")
         st.stop()
 
-    st.info(f"Extracted {len(rfp_text):,} characters.")
+    # ── Step 2: combine all texts into one and send a SINGLE AI call ──────
+    combined_text = "\n\n".join(combined_parts)
+    fnames = [f.name for f in uploaded_files if f.name not in [x[0] for x in failures]]
+    label = fnames[0] if len(fnames) == 1 else f"Combined ({len(fnames)} RFPs)"
+    st.session_state.combined_label = label
 
-    status_box = st.status("Analyzing fit against your company profile...", expanded=False)
+    char_count = len(combined_text)
+    st.info(f"📄 {len(combined_parts)} document(s) combined — {char_count:,} characters total. Sending to AI...")
+
+    status_box = st.status("Analyzing combined RFPs against your company profile...", expanded=False)
 
     def handle_retry(attempt, wait_seconds, reason):
         status_box.update(
@@ -86,7 +174,12 @@ if st.session_state.ready:
 
     try:
         with status_box:
-            st.session_state.result = analyze_rfp(rfp_text, company_profile, on_retry=handle_retry)
+            st.session_state.result = analyze_rfp(
+                combined_text,
+                company_profile,
+                on_retry=handle_retry,
+                num_documents=len(combined_parts),
+            )
         status_box.update(label="Analysis complete.", state="complete")
     except RfpAnalysisError as e:
         status_box.update(label="Analysis failed.", state="error")
@@ -97,23 +190,53 @@ if st.session_state.ready:
         st.error(f"AI analysis failed: {e}")
         st.stop()
 
+    # ── Step 3: persist to history so it can be reloaded later without AI ──
+    try:
+        new_id = save_analysis(label, st.session_state.result)
+        st.session_state.history_id = new_id
+        st.session_state.loaded_from_history = False
+    except Exception as e:
+        st.warning(f"Analysis succeeded but could not be saved to history: {e}")
+
+# ---------- render result ----------
 result = st.session_state.result
+label  = st.session_state.combined_label
+
+
+def total_deliverable_weeks(deliverables):
+    total = 0
+    for d in deliverables:
+        children = d.get("children", [])
+        if children:
+            total += sum(c.get("weeks_estimate", 0) for c in children)
+        else:
+            total += d.get("weeks_estimate", 0)
+    return total
+
 
 if result:
     st.divider()
 
-    verdict = result.get("verdict", "CONDITIONAL")
-    vstyle = VERDICT_STYLE.get(verdict, VERDICT_STYLE["CONDITIONAL"])
+    if st.session_state.history_id:
+        if st.session_state.loaded_from_history:
+            st.caption(f"📂 Loaded from saved history — ID: `{st.session_state.history_id}` (no AI call made)")
+        else:
+            st.caption(f"💾 Saved — ID: `{st.session_state.history_id}` (search for it in the sidebar anytime)")
+
+    verdict  = result.get("verdict", "CONDITIONAL")
+    vstyle   = VERDICT_STYLE.get(verdict, VERDICT_STYLE["CONDITIONAL"])
     fit_score = result.get("fit_score", 0)
 
     deliverables = result.get("deliverables", [])
-    total_weeks = sum(d.get("weeks_estimate", 0) for d in deliverables)
-    compliance = result.get("compliance", {})
-    all_items = [item for dept_items in compliance.values() for item in dept_items]
-    met_count = sum(1 for i in all_items if i.get("status") == "MET")
-    gap_count = sum(1 for i in all_items if i.get("status") == "GAP")
+    total_weeks  = total_deliverable_weeks(deliverables)
+    total_items  = sum(len(d.get("children", [])) or 1 for d in deliverables)
 
-    # ---------- hero card ----------
+    compliance = result.get("compliance", {})
+    all_items  = [item for dept_items in compliance.values() for item in dept_items]
+    met_count  = sum(1 for i in all_items if i.get("status") == "MET")
+    gap_count  = sum(1 for i in all_items if i.get("status") == "GAP")
+
+    # ── hero card ─────────────────────────────────────────────────────────
     st.markdown(
         f"""
         <div style="border:1px solid #ddd; border-radius:10px; padding:24px; background:{vstyle['bg']};">
@@ -136,7 +259,7 @@ if result:
 
     st.write("")
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Deliverables", len(deliverables))
+    c1.metric("Deliverables", total_items)
     c2.metric("Est. Weeks Total", total_weeks)
     c3.metric("Requirements Met", met_count)
     c4.metric("Compliance Gaps", gap_count)
@@ -145,18 +268,38 @@ if result:
 
     tabs = st.tabs([
         "📦 Deliverables", "📊 Evaluation Criteria", "✅ Compliance Checklist",
-        "📅 Dates & Budget", "🎯 Opportunity Assessment",
+        "📅 Dates & Budget", "🎯 Opportunity Assessment", "⬇ Downloads",
     ])
 
-    # --- Deliverables ---
+    # ── Deliverables ──────────────────────────────────────────────────────
     with tabs[0]:
         for i, d in enumerate(deliverables, 1):
-            tag = "🔴 MANDATORY" if d.get("mandatory") else "🟢 OPTIONAL"
-            st.markdown(f"**{i:02d}. {d.get('title', '')}**  \n{d.get('description', '')}")
-            st.caption(f"{tag} · {d.get('weeks_estimate', '?')} wk estimate")
+            tag      = "🔴 MANDATORY" if d.get("mandatory") else "🟢 OPTIONAL"
+            children = d.get("children", [])
+            parent_wk = (
+                sum(c.get("weeks_estimate", 0) for c in children)
+                if children else d.get("weeks_estimate", "?")
+            )
+            st.markdown(f"**{i}. {d.get('title', '')}**")
+            if d.get("description"):
+                st.caption(d.get("description"))
+            st.caption(f"{tag} · {parent_wk} wk estimate (total)")
+
+            for j, c in enumerate(children, 1):
+                ctag = "🔴 MANDATORY" if c.get("mandatory") else "🟢 OPTIONAL"
+                st.markdown(
+                    f"<div style='margin-left:28px; border-left:2px solid #e0e0e0;"
+                    f"padding-left:14px; margin-bottom:10px;'>"
+                    f"<b>{i}.{j} {c.get('title', '')}</b><br>"
+                    f"<span style='color:#555;'>{c.get('description', '')}</span><br>"
+                    f"<span style='color:#888; font-size:0.85rem;'>"
+                    f"{ctag} · {c.get('weeks_estimate', '?')} wk estimate</span>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
             st.divider()
 
-    # --- Evaluation Criteria ---
+    # ── Evaluation Criteria ───────────────────────────────────────────────
     with tabs[1]:
         for c in result.get("evaluation_criteria", []):
             col_a, col_b = st.columns([4, 1])
@@ -164,7 +307,7 @@ if result:
             col_b.markdown(f"### {c.get('weight_pct', '?')}%")
             st.divider()
 
-    # --- Compliance Checklist ---
+    # ── Compliance Checklist ──────────────────────────────────────────────
     with tabs[2]:
         for dept in ["Legal", "Accounting", "Technical", "Operations"]:
             items = compliance.get(dept, [])
@@ -181,21 +324,21 @@ if result:
                 st.caption(item.get("note", ""))
             st.write("")
 
-    # --- Dates & Budget ---
+    # ── Dates & Budget ────────────────────────────────────────────────────
     with tabs[3]:
         kb = result.get("key_dates_budget", {})
         labels = {
-            "submission_deadline": "Submission Deadline",
+            "submission_deadline":    "Submission Deadline",
             "pre_proposal_conference": "Pre-proposal Conference",
-            "qa_deadline": "Q&A Deadline",
-            "project_timeline": "Project Timeline",
-            "total_budget": "Total Budget",
-            "bond_requirements": "Bond Requirements",
+            "qa_deadline":            "Q&A Deadline",
+            "project_timeline":       "Project Timeline",
+            "total_budget":           "Total Budget",
+            "bond_requirements":      "Bond Requirements",
         }
-        for key, label in labels.items():
-            st.markdown(f"**{label}:** {kb.get(key, 'Not specified.')}")
+        for key, lbl in labels.items():
+            st.markdown(f"**{lbl}:** {kb.get(key, 'Not specified.')}")
 
-    # --- Opportunity Assessment ---
+    # ── Opportunity Assessment ────────────────────────────────────────────
     with tabs[4]:
         oa = result.get("opportunity_assessment", {})
         st.markdown(f"**Key reasons behind the {vstyle['label']} call:**")
@@ -207,80 +350,55 @@ if result:
             for d in disqualifiers:
                 st.markdown(f"- :red[{d}]")
 
-    # ---------- downloadable report ----------
-    def fmt_list(items):
-        return "\n".join(f"- {i}" for i in items) if items else "_None._"
+    # ── Downloads ─────────────────────────────────────────────────────────
+    with tabs[5]:
+        base = label.replace(" ", "_").replace("(", "").replace(")", "").replace(",", "")
+        id_suffix = f"_{st.session_state.history_id}" if st.session_state.history_id else ""
 
-    def fmt_deliverables():
-        out = []
-        for i, d in enumerate(deliverables, 1):
-            tag = "MANDATORY" if d.get("mandatory") else "OPTIONAL"
-            out.append(f"{i}. **{d.get('title','')}** ({tag}, {d.get('weeks_estimate','?')} wk)\n   {d.get('description','')}")
-        return "\n\n".join(out)
+        dcol1, dcol2, dcol3 = st.columns(3)
 
-    def fmt_eval():
-        out = []
-        for c in result.get("evaluation_criteria", []):
-            out.append(f"- **{c.get('name','')}** — {c.get('weight_pct','?')}%\n  {c.get('description','')}")
-        return "\n".join(out)
+        with dcol1:
+            try:
+                deliv_pdf = generate_deliverables_pdf(deliverables, label)
+                st.download_button(
+                    "⬇ Deliverables (PDF)",
+                    deliv_pdf,
+                    file_name=f"deliverables_{base}.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                )
+            except Exception as e:
+                st.error(f"Could not generate deliverables PDF: {e}")
 
-    def fmt_compliance():
-        out = []
-        for dept in ["Legal", "Accounting", "Technical", "Operations"]:
-            items = compliance.get(dept, [])
-            if not items:
-                continue
-            out.append(f"### {dept}\n")
-            for item in items:
-                out.append(f"- [{item.get('status','REVIEW')}] {item.get('requirement','')}\n  {item.get('note','')}")
-        return "\n".join(out)
+        with dcol2:
+            try:
+                full_pdf = generate_pdf_report(result, label)
+                st.download_button(
+                    "⬇ Full Report (PDF)",
+                    full_pdf,
+                    file_name=f"rfp_analysis_{base}.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                    type="primary",
+                )
+            except Exception as e:
+                st.error(f"Could not generate full PDF: {e}")
 
-    kb = result.get("key_dates_budget", {})
-    report = f"""# RFP Analysis: {st.session_state.fname}
+        with dcol3:
+            try:
+                json_bytes = json.dumps(result, ensure_ascii=False, indent=2).encode("utf-8")
+                st.download_button(
+                    "⬇ Full Report (JSON)",
+                    json_bytes,
+                    file_name=f"rfp_analysis_{base}{id_suffix}.json",
+                    mime="application/json",
+                    use_container_width=True,
+                )
+            except Exception as e:
+                st.error(f"Could not generate JSON export: {e}")
 
-**Verdict:** {vstyle['label']} — Fit Score: {fit_score}/100
-
-{result.get('headline_summary', '')}
-
----
-
-## 1. DELIVERABLES & TIME ESTIMATE
-
-{fmt_deliverables()}
-
----
-
-## 2. EVALUATION CRITERIA
-
-{fmt_eval()}
-
----
-
-## 3. DEPARTMENT COMPLIANCE CHECKLIST
-
-{fmt_compliance()}
-
----
-
-## 4. KEY DATES & BUDGET
-
-- Submission Deadline: {kb.get('submission_deadline', 'Not specified.')}
-- Pre-proposal Conference: {kb.get('pre_proposal_conference', 'Not specified.')}
-- Q&A Deadline: {kb.get('qa_deadline', 'Not specified.')}
-- Project Timeline: {kb.get('project_timeline', 'Not specified.')}
-- Total Budget: {kb.get('total_budget', 'Not specified.')}
-- Bond Requirements: {kb.get('bond_requirements', 'Not specified.')}
-
----
-
-## 5. OPPORTUNITY ASSESSMENT
-
-**Key reasons:**
-{fmt_list(result.get('opportunity_assessment', {}).get('key_reasons', []))}
-
-**Potential disqualifiers:**
-{fmt_list(result.get('opportunity_assessment', {}).get('potential_disqualifiers', []))}
-"""
-
-    st.divider()
-    st.download_button("⬇ Download Full Report", report, "rfp_analysis.md", "text/markdown")
+        if st.session_state.history_id:
+            st.caption(
+                f"This analysis is saved under ID **{st.session_state.history_id}** — "
+                f"search for it in the sidebar to reload it instantly, no AI call needed."
+            )
