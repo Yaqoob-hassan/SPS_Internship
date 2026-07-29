@@ -1,92 +1,192 @@
-# 📄 RFP Analyzer
+<h1 align="center">🚀 SPS Internship Projects</h1>
 
-**AI-powered Go/No-Go decision support tool for Request for Proposal (RFP) documents.**
+<h3 align="center">
+AI-Powered RFP Automation • Intelligent Document Processing • Enterprise Workflow Automation
+</h3>
 
-Upload an RFP, compare it against your company's profile, and get an instant fit score, verdict, and department-by-department compliance breakdown — instead of manually reading 20+ pages to figure out whether you should even bid.
-
----
-
-## 🚀 What It Does
-
-Most RFPs bury the things that actually matter — insurance minimums, bond requirements, mandatory deliverables, evaluation weights — inside dense procurement language. RFP Analyzer reads the document, compares it against a configurable company profile, and surfaces:
-
-- ✅ **Fit Score (0–100)** and a clear verdict — `GO` / `CONDITIONAL` / `NO-GO`
-- 📦 **Deliverables** — mandatory vs. optional, with effort estimates
-- 📊 **Evaluation Criteria** — weighted scoring breakdown as defined in the RFP
-- 🧾 **Compliance Checklist** — split by department (**Legal**, **Accounting**, **Technical**, **Operations**), each item flagged `MET` / `GAP` / `REVIEW`
-- 📅 **Key Dates & Budget** — deadlines, contract value, bonding requirements
-- ⚠️ **Risk Assessment** — top risks and a go/no-go recommendation with reasoning
-
-Export the result as a clean **Markdown report** or a styled **PDF case file**.
+<p align="center">
+<img src="https://readme-typing-svg.demolab.com?font=Fira+Code&size=22&pause=1200&color=2F81F7&center=true&vCenter=true&width=750&lines=Building+Enterprise+AI+Solutions;Automating+RFP+Analysis+using+LLMs;Document+Intelligence+%7C+Workflow+Automation;Streamlit+%7C+Python+%7C+OpenAI+%7C+Gemini;Learning+by+Building+Real+Products" />
+</p>
 
 ---
 
-## 🛠️ Tech Stack
+# 📌 About this Repository
 
-| Layer | Tool |
-|---|---|
-| UI | [Streamlit](https://streamlit.io/) |
-| PDF text extraction | [pdfplumber](https://github.com/jsvine/pdfplumber) |
-| AI analysis | [Google Gemini](https://ai.google.dev/) (`gemini-2.5-flash`, structured JSON output) |
-| PDF report generation | [ReportLab](https://www.reportlab.com/) |
-| Config | `python-dotenv` |
+This repository contains all projects developed during my **SPS Internship**.
+
+The primary focus of this internship is building **AI-powered enterprise solutions** that automate manual workflows, improve productivity, and simplify document processing using Large Language Models (LLMs).
+
+The projects combine modern AI technologies with practical software engineering to solve real-world business problems.
 
 ---
 
-## 📂 Project Structure
+# 🎯 Internship Objectives
+
+- 🤖 Build intelligent AI applications
+- 📄 Automate Request for Proposal (RFP) processing
+- 🧠 Apply Large Language Models to enterprise workflows
+- ⚙️ Reduce manual effort through automation
+- 📊 Generate actionable insights from documents
+- 🚀 Build production-ready AI systems
+
+---
+
+# 🧠 Featured Project
+
+# 🚀 RFP Analyzer
+
+An AI-powered application that understands and analyzes Request for Proposal (RFP) documents automatically.
+
+## Features
+
+✅ PDF Upload
+
+Upload RFP documents directly into the application.
+
+---
+
+✅ AI Document Analysis
+
+Extracts important information including:
+
+- Deliverables
+- Scope of Work
+- Evaluation Criteria
+- Submission Requirements
+- Timelines
+- Technical Requirements
+
+---
+
+✅ Intelligent Information Extraction
+
+The system automatically identifies key sections instead of manually searching through hundreds of pages.
+
+---
+
+✅ AI Generated Insights
+
+Provides structured summaries for faster decision making.
+
+---
+
+✅ Report Generation
+
+Generate professional reports containing the extracted information.
+
+---
+
+# 🛠 Tech Stack
+
+### Programming
+
+<p>
+<img src="https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white"/>
+</p>
+
+### AI & LLMs
+
+<p>
+<img src="https://img.shields.io/badge/OpenAI-412991?style=for-the-badge&logo=openai&logoColor=white"/>
+<img src="https://img.shields.io/badge/Google_Gemini-4285F4?style=for-the-badge&logo=google&logoColor=white"/>
+</p>
+
+### Frameworks
+
+<p>
+<img src="https://img.shields.io/badge/Streamlit-FF4B4B?style=for-the-badge&logo=streamlit&logoColor=white"/>
+</p>
+
+### Libraries
+
+<p>
+<img src="https://img.shields.io/badge/Pandas-150458?style=for-the-badge&logo=pandas&logoColor=white"/>
+<img src="https://img.shields.io/badge/PyPDF-FF0000?style=for-the-badge"/>
+</p>
+
+### Development
+
+<p>
+<img src="https://img.shields.io/badge/Git-F05032?style=for-the-badge&logo=git&logoColor=white"/>
+<img src="https://img.shields.io/badge/GitHub-181717?style=for-the-badge&logo=github&logoColor=white"/>
+<img src="https://img.shields.io/badge/VS_Code-007ACC?style=for-the-badge&logo=visualstudiocode&logoColor=white"/>
+</p>
+
+---
+
+# 📂 Repository Structure
 
 ```
-RFP_analyzer/
-├── app.py            # Streamlit UI — upload, company profile, results, downloads
-├── ai_engine.py       # Gemini prompt, structured JSON parsing, retry/backoff logic
-├── pdf_reader.py       # PDF text extraction (pdfplumber)
-├── pdf_report.py       # Generates the styled downloadable PDF report
-└── .env                 # GEMINI_API_KEY (not committed)
+SPS_Internship/
+
+│
+├── RFP_analyzer/
+│ ├── app.py
+│ ├── ai_engine.py
+│ ├── pdf_reader.py
+│ ├── pdf_report.py
+│ ├── history.py
+│ ├── requirements.txt
+│ └── assets/
+│
+└── README.md
 ```
 
 ---
 
-## ⚙️ How It Works
+# 🚀 Current Progress
 
-1. **Upload** an RFP PDF through the Streamlit interface.
-2. **Extract** text from every page (`pdf_reader.py`).
-3. **Define your company profile** — insurance coverage, certifications, revenue, capabilities — editable directly in the sidebar.
-4. **Analyze** — the RFP text and company profile are sent to Gemini with a strict JSON schema, so the model returns structured data (not free-text) covering deliverables, evaluation criteria, compliance status per department, dates/budget, and an overall fit assessment.
-5. **Review** results in-app across sectioned tabs, with a verdict card and key metrics (deliverables count, total weeks, requirements met, compliance gaps) up top.
-6. **Export** the full analysis as Markdown or PDF.
-
----
-
-## 🧠 Key Design Decisions
-
-- **Structured JSON over free-text parsing** — early versions asked the model for markdown and sliced it by header position, which was fragile. Forcing strict JSON output (`response_mime_type: application/json`) makes scoring, counting, and status badges computable rather than guessed.
-- **Retry with backoff, but quota-aware** — transient errors (429 rate limits, 500/503 server errors) are retried automatically with exponential/linear backoff. Daily quota exhaustion is detected separately and fails fast with a clear message, since retrying a daily cap is pointless.
-- **Two-step "set flag, then rerun" pattern** — Streamlit reruns the whole script on every interaction, so the upload/analyze flow uses `st.session_state` to avoid re-triggering expensive AI calls on unrelated UI interactions.
+| Project | Status |
+|----------|--------|
+| RFP Analyzer | ✅ Completed |
+| AI Report Generator | ✅ Completed |
+| History Management | ✅ Completed |
+| PDF Processing | ✅ Completed |
+| Future SPS Projects | 🚧 Coming Soon |
 
 ---
 
-## ▶️ Running Locally
+# 📸 Preview
 
-```bash
-git clone https://github.com/Yaqoob-hassan/SPS_Internship.git
-cd SPS_Internship/RFP_analyzer
-
-pip install streamlit pdfplumber google-generativeai python-dotenv reportlab
-
-# Add your Gemini API key
-echo "GEMINI_API_KEY=your_key_here" > .env
-
-streamlit run app.py
-```
+> Screenshots and demo GIFs will be added soon.
 
 ---
 
-## 📌 Notes
+# 🎯 Future Improvements
 
-- Built and tested against a synthetic sample RFP (a fictional city government permitting-system procurement) designed to exercise every analysis path — mandatory/optional deliverables, weighted criteria, and a deliberate insurance compliance gap.
-- Gemini's free tier caps requests at 20/day per project — for heavier testing, enable billing on the underlying Google Cloud project.
-- This project was built as part of the **SPS Internship** under [Yaqoob-hassan/SPS_Internship](https://github.com/Yaqoob-hassan/SPS_Internship).
+- AI Chat with RFP Documents
+- Multi-document Comparison
+- Vector Database Integration
+- Semantic Search
+- Team Collaboration
+- RAG Pipeline
+- AI Agent Automation
+- Cloud Deployment
 
 ---
 
-*Part of [@Yaqoob-hassan](https://github.com/Yaqoob-hassan)'s internship project portfolio.*
+# 🤝 Connect With Me
+
+<p align="left">
+
+<a href="https://github.com/Yaqoob-hassan">
+<img src="https://img.shields.io/badge/GitHub-181717?style=for-the-badge&logo=github&logoColor=white"/>
+</a>
+
+<a href="https://www.linkedin.com/in/muhammad-yaqoob-hassan/">
+<img src="https://img.shields.io/badge/LinkedIn-0A66C2?style=for-the-badge&logo=linkedin&logoColor=white"/>
+</a>
+
+<a href="mailto:myaqoobh13@gmail.com">
+<img src="https://img.shields.io/badge/Gmail-D14836?style=for-the-badge&logo=gmail&logoColor=white"/>
+</a>
+
+</p>
+
+---
+
+<h3 align="center">
+
+🚀 Building AI solutions that automate real-world business workflows.
+
+</h3>
