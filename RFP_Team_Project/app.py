@@ -10,6 +10,7 @@ from utils.document_processor import (
     RFPProcessor,
     extract_raw_pages_from_pdf,
     get_highlighted_page_image,
+    find_text_location,
 )
 from datetime import datetime
 from reportlab.lib.pagesizes import letter
@@ -20,7 +21,7 @@ from reportlab.lib.enums import TA_CENTER, TA_LEFT
 import io
 import plotly.graph_objects as go
 
-load_dotenv()
+load_dotenv(override=True)
 
 st.set_page_config(
     page_title="RFP Document Processor",
@@ -100,11 +101,23 @@ def inject_theme_css(theme: dict):
     .streamlit-expanderHeader, [data-testid="stExpander"] summary {{
         color: {theme['text']} !important;
     }}
+    .stTextInput input,
+    .stTextInput textarea,
+    div[data-testid="stTextInput"] input,
+    input[type="text"],
+    input[type="password"] {{
+        background-color: {theme['card']} !important;
+        color: {theme['text']} !important;
+        border: 2px solid {theme['card_border']} !important;
+        border-radius: 10px !important;
+    }}
+    .stTextInput input::placeholder {{
+        color: {theme['text_muted']} !important;
+        opacity: 0.8 !important;
+    }}
     div.stButton > button p,
     div.stButton > button span,
-    button[kind="secondary"],
     button[kind="primary"],
-    button[data-testid="baseButton-secondary"],
     button[data-testid="baseButton-primary"] {{
         background-color: {theme['accent']} !important;
         color: #FFFFFF !important;
@@ -113,10 +126,31 @@ def inject_theme_css(theme: dict):
         font-family: 'Quicksand', sans-serif !important;
         font-weight: 600 !important;
     }}
+    button[kind="secondary"],
+    button[data-testid="baseButton-secondary"] {{
+        background-color: {theme['accent_dark']} !important;
+        color: #FFFFFF !important;
+        border-radius: 10px !important;
+        border: 2px solid {theme['accent_dark']} !important;
+        font-family: 'Quicksand', sans-serif !important;
+        font-weight: 600 !important;
+    }}
+    button[kind="secondary"] p,
+    button[kind="secondary"] span {{
+        color: #FFFFFF !important;
+    }}
     div.stButton > button:hover,
-    button[kind="secondary"]:hover,
     button[kind="primary"]:hover {{
         background-color: {theme['accent_dark']} !important;
+        color: #FFFFFF !important;
+    }}
+    button[kind="secondary"]:hover {{
+        background-color: {theme['accent']} !important;
+        color: #FFFFFF !important;
+        border-color: {theme['accent']} !important;
+    }}
+    button[kind="secondary"]:hover p,
+    button[kind="secondary"]:hover span {{
         color: #FFFFFF !important;
     }}
     div.stButton > button:disabled,
@@ -135,6 +169,39 @@ def inject_theme_css(theme: dict):
     }}
     div.stDownloadButton > button:hover {{
         background-color: {theme['accent_dark']} !important;
+    }}
+
+    /* Best-effort styling of Streamlit's native bordered containers
+       (st.container(border=True)) so each section reads as one clear,
+       self-contained card with an obvious start and end. */
+    div[data-testid="stVerticalBlockBorderWrapper"] {{
+        border: 2px solid {theme['card_border']} !important;
+        border-radius: 16px !important;
+        background: {theme['card']} !important;
+        padding: 6px 4px !important;
+        margin-bottom: 18px !important;
+    }}
+
+    .section-header-bar {{
+        background: linear-gradient(90deg, {theme['accent']}, {theme['accent_dark']});
+        color: #FFFFFF !important;
+        border-radius: 12px;
+        padding: 10px 18px;
+        margin-bottom: 10px;
+        font-family: 'Baloo 2', cursive;
+        font-size: 19px;
+        font-weight: 700;
+    }}
+    .section-header-bar * {{
+        color: #FFFFFF !important;
+    }}
+    .section-end-marker {{
+        text-align: center;
+        color: {theme['text_muted']};
+        font-size: 11px;
+        letter-spacing: 2px;
+        opacity: 0.6;
+        padding: 6px 0 2px 0;
     }}
 
     .rfp-card {{
@@ -165,11 +232,42 @@ def inject_theme_css(theme: dict):
 
     .rfp-badge {{
         font-size: 11px;
-        color: {theme['accent_dark']};
-        background: rgba(166,111,201,0.15);
+        font-weight: 600;
+        color: #FFFFFF;
+        background: {theme['accent_dark']};
         padding: 2px 10px;
         border-radius: 10px;
-        border: 1px solid rgba(166,111,201,0.25);
+        border: 1px solid {theme['accent_dark']};
+        white-space: nowrap;
+    }}
+
+    .rfp-tag-source {{
+        font-size: 11px;
+        color: {theme['text_muted']};
+        background: rgba(0,0,0,0.05);
+        padding: 2px 10px;
+        border-radius: 10px;
+        border: 1px solid rgba(0,0,0,0.08);
+        white-space: nowrap;
+    }}
+
+    .rfp-tag-page {{
+        font-size: 11px;
+        color: {theme['go']};
+        background: rgba(76,154,107,0.15);
+        padding: 2px 10px;
+        border-radius: 10px;
+        border: 1px solid rgba(76,154,107,0.25);
+        white-space: nowrap;
+    }}
+
+    .rfp-count-tag {{
+        display: inline-block;
+        font-size: 12px;
+        font-weight: 600;
+        padding: 3px 12px;
+        border-radius: 12px;
+        margin-right: 6px;
         white-space: nowrap;
     }}
 
@@ -420,16 +518,21 @@ def render_pdf_viewer(theme):
 # ============================================================
 # RENDER: Deliverables
 # ============================================================
-def render_deliverables(deliverables, source_files_available=None):
-    """Render deliverables with clean cream/lilac cards + a 'View Source' button per item."""
+def render_deliverables(deliverables, source_files_available=None, pdf_files_bytes=None, pdf_raw_pages=None):
+    """Render deliverables with count tags up top + a clean tag row (source/section/page/View) per item."""
     if not deliverables:
         st.info("No deliverables found in this RFP.")
         return
 
     source_files_available = source_files_available or set()
+    pdf_files_bytes = pdf_files_bytes or {}
+    pdf_raw_pages = pdf_raw_pages or {}
 
     if isinstance(deliverables, list) and len(deliverables) > 0 and isinstance(deliverables[0], str):
         deliverables = [{"category": "General", "items": deliverables}]
+
+    main_count = sum(1 for cat in deliverables if cat.get('items'))
+    sub_count = sum(len(cat.get('items', [])) for cat in deliverables)
 
     category_counter = 1
     for cat_group in deliverables:
@@ -463,14 +566,23 @@ def render_deliverables(deliverables, source_files_available=None):
 
             section_ref_clean = re.sub(r'<[^>]+>', '', str(section_ref))
             section_ref_clean = section_ref_clean.replace('&lt;', '<').replace('&gt;', '>')
-            section_display = section_ref_clean if section_ref_clean and section_ref_clean != 'N/A' else ""
+            section_display = section_ref_clean if section_ref_clean and section_ref_clean != 'N/A' else "N/A"
 
+            source_display = source_file
             if source_file and source_file != 'Unknown' and source_file != 'Unknown file':
                 source_display = source_file.replace('", "', ', ').replace('"', '')
-                file_display = f"[From: {source_display}]" if ',' in source_display else f"[From: {source_file}]"
-                full_reason = f"{file_display} {reason}"
-            else:
-                full_reason = reason
+                if ',' in source_display:
+                    source_display = source_display.split(',')[0].strip()
+
+            pdf_bytes = pdf_files_bytes.get(source_file)
+            can_view = source_file in source_files_available and bool(quote)
+            page_num = None
+            if can_view and pdf_bytes:
+                location = find_text_location(pdf_bytes, quote, pdf_raw_pages.get(source_file))
+                if location:
+                    page_num = location["page_num"] + 1
+
+            page_tag = f'<span class="rfp-tag-page">Page {page_num}</span>' if page_num else ''
 
             row_col1, row_col2 = st.columns([9, 1])
 
@@ -480,16 +592,19 @@ def render_deliverables(deliverables, source_files_available=None):
                     <div style="display:flex; align-items:baseline; flex-wrap:wrap; gap:8px;">
                         <span style="font-weight:600; min-width:50px;">{category_counter}.{item_counter}</span>
                         <span style="flex:1;">{item_name}</span>
-                        <span class="rfp-badge">{section_display}</span>
                     </div>
-                    <div class="rfp-reason">{full_reason}</div>
+                    <div class="rfp-reason" style="font-style:normal; padding-left:0; margin-top:6px;">{reason}</div>
+                    <div style="margin-top:6px; display:flex; flex-wrap:wrap; gap:6px;">
+                        <span class="rfp-tag-source">{source_display}</span>
+                        <span class="rfp-badge">§ {section_display}</span>
+                        {page_tag}
+                    </div>
                 </div>
                 """, unsafe_allow_html=True)
 
             with row_col2:
-                can_view = source_file in source_files_available and bool(quote)
                 if st.button(
-                    "View Source",
+                    "View",
                     key=f"view_pdf_{category_counter}_{item_counter}",
                     disabled=not can_view,
                     help="Open the exact PDF page and highlight this deliverable"
@@ -502,6 +617,105 @@ def render_deliverables(deliverables, source_files_available=None):
             item_counter += 1
 
         category_counter += 1
+
+def _deliverable_counts(deliverables):
+    """(main_category_count, sub_item_count) for badge display."""
+    if not deliverables:
+        return 0, 0
+    if isinstance(deliverables, list) and len(deliverables) > 0 and isinstance(deliverables[0], str):
+        return 1, len(deliverables)
+    main_count = sum(1 for cat in deliverables if cat.get('items'))
+    sub_count = sum(len(cat.get('items', [])) for cat in deliverables)
+    return main_count, sub_count
+
+
+def _bordered_container():
+    """
+    st.container(border=True) requires Streamlit >= 1.28. Older installs
+    raise a TypeError on the unexpected 'border' kwarg -- which, depending on
+    version, can render as a blank page instead of a clean in-app error. This
+    falls back to a plain container so the app still works either way, just
+    without the visual card border on very old Streamlit versions.
+    """
+    try:
+        return st.container(border=True)
+    except TypeError:
+        return st.container()
+
+
+def render_collapsible_section(section_key, title, render_fn, badge_html="", default_open=False):
+    """
+    Render a section as a clearly bounded card: a colored header bar (with
+    optional count-tag badges), a View/Hide toggle, and -- when open -- the
+    section's content followed by an explicit "end of section" marker. The
+    whole thing sits inside a bordered container (st.container(border=True))
+    so a first-time user can see exactly where one section stops and the
+    next begins, instead of guessing based on scroll position.
+
+    Deliberately NOT st.expander for the outer layer -- several inner
+    renderers (checklist items, conflicts, certifications) already use
+    st.expander per-item, and Streamlit disallows nesting an expander inside
+    another expander. This toggle pattern gives the same "click to see
+    details" UX while staying compatible.
+    """
+    state_key = f"show_section_{section_key}"
+    if state_key not in st.session_state:
+        st.session_state[state_key] = default_open
+    is_open = st.session_state[state_key]
+
+    with _bordered_container():
+        header_col, btn_col = st.columns([6, 1])
+        with header_col:
+            st.markdown(f'<div class="section-header-bar">{title}</div>', unsafe_allow_html=True)
+            if badge_html:
+                st.markdown(badge_html, unsafe_allow_html=True)
+        with btn_col:
+            st.markdown("<div style='margin-top:2px;'></div>", unsafe_allow_html=True)
+            btn_label = "Hide" if is_open else "View Details"
+            btn_type = "secondary" if is_open else "primary"
+            if st.button(btn_label, key=f"toggle_{section_key}", use_container_width=True, type=btn_type):
+                st.session_state[state_key] = not is_open
+                st.rerun()
+
+        if is_open:
+            st.markdown("<hr style='margin:8px 0 14px 0; opacity:0.25;'>", unsafe_allow_html=True)
+            render_fn()
+            st.markdown(
+                f'<div class="section-end-marker">● ● ●  END OF {title.upper()}  ● ● ●</div>',
+                unsafe_allow_html=True
+            )
+
+
+def render_go_no_go_status_badge(go_no_go):
+    go = go_no_go.get('go_count', 0)
+    nogo = go_no_go.get('no_go_count', 0)
+    cond = go_no_go.get('conditional_count', go_no_go.get('escalate_count', 0))
+    return (
+        f'<span class="status-pill status-go">GO: {go}</span> '
+        f'<span class="status-pill status-nogo">NO-GO: {nogo}</span> '
+        f'<span class="status-pill status-escalate">CONDITIONAL: {cond}</span>'
+    )
+
+
+def _certification_badge(certifications):
+    required = sum(1 for c in certifications if c.get('type') == 'Required')
+    recommended = sum(1 for c in certifications if c.get('type') == 'Recommended')
+    return (
+        f'<span class="status-pill status-nogo">Required: {required}</span> '
+        f'<span class="status-pill status-escalate">Recommended: {recommended}</span>'
+    )
+
+
+def _conflict_badge(conflicts):
+    high = sum(1 for c in conflicts if c.get('severity') == 'High')
+    medium = sum(1 for c in conflicts if c.get('severity') == 'Medium')
+    low = sum(1 for c in conflicts if c.get('severity') == 'Low')
+    return (
+        f'<span class="status-pill status-nogo">High: {high}</span> '
+        f'<span class="status-pill status-escalate">Medium: {medium}</span> '
+        f'<span class="status-pill status-go">Low: {low}</span>'
+    )
+
 
 # ============================================================
 # RENDER: Go/No-Go Dashboard (decision card + pie chart)
@@ -569,6 +783,95 @@ def render_go_no_go_dashboard(go_no_go, theme):
             st.caption("No checklist items to chart yet.")
 
 # ============================================================
+# RENDER: Conflict / Contradiction Check
+# ============================================================
+def render_conflicts_section(conflicts, conflict_summary, theme, pdf_files_bytes=None, pdf_raw_pages=None):
+    pdf_files_bytes = pdf_files_bytes or {}
+    pdf_raw_pages = pdf_raw_pages or {}
+
+    if not conflicts and not conflict_summary:
+        st.warning(
+            "This analysis doesn't have conflict-check results yet — it was likely run "
+            "before this feature was added. Scroll down to **'Add More Files to This "
+            "Analysis'** and click **'Add Files & Re-run Analysis'** (you can re-upload "
+            "the same file) to regenerate it with conflict detection included, or start "
+            "a **'Process New Document'** run."
+        )
+        return
+
+    if not conflicts:
+        if conflict_summary and "could not be completed" in conflict_summary.lower():
+            st.error(conflict_summary)
+        else:
+            st.success(conflict_summary or "No internal conflicts found in this RFP.")
+        return
+
+    high = sum(1 for c in conflicts if c.get('severity') == 'High')
+    medium = sum(1 for c in conflicts if c.get('severity') == 'Medium')
+    low = sum(1 for c in conflicts if c.get('severity') == 'Low')
+
+    banner_text = f"{conflict_summary}  ({high} high · {medium} medium · {low} low severity)"
+    if high:
+        st.error(banner_text)
+    elif medium:
+        st.warning(banner_text)
+    else:
+        st.info(banner_text)
+
+    severity_rank = {"High": 0, "Medium": 1, "Low": 2}
+    severity_badge_class = {"High": "status-nogo", "Medium": "status-escalate", "Low": "status-go"}
+    sorted_conflicts = sorted(conflicts, key=lambda c: severity_rank.get(c.get('severity'), 3))
+
+    for idx, c in enumerate(sorted_conflicts, 1):
+        severity = c.get('severity', 'Medium')
+        badge_class = severity_badge_class.get(severity, 'status-escalate')
+        conflict_type = c.get('type', 'Conflict')
+        description = c.get('description', '')
+        header = f"[{conflict_type}] {description[:90]}{'...' if len(description) > 90 else ''}"
+
+        with st.expander(header):
+            st.markdown(
+                f'<span class="status-pill {badge_class}">{severity} Severity</span>',
+                unsafe_allow_html=True
+            )
+            st.markdown(f"**What conflicts:** {description}")
+
+            col_a, col_b = st.columns(2)
+            for label, stmt_key, col in (("A", "statement_a", col_a), ("B", "statement_b", col_b)):
+                stmt = c.get(stmt_key, {}) or {}
+                source_file = stmt.get('source_file', 'Unknown')
+                quote = stmt.get('quote') or stmt.get('text', '')
+
+                with col:
+                    st.markdown(f"**Statement {label}** — {stmt.get('section_ref', 'N/A')}")
+                    st.caption(f"Source: {source_file}")
+                    if quote:
+                        st.markdown(f"> {quote}")
+
+                    pdf_bytes = pdf_files_bytes.get(source_file)
+                    can_locate = bool(pdf_bytes and quote)
+
+                    page_num = None
+                    if can_locate:
+                        location = find_text_location(pdf_bytes, quote, pdf_raw_pages.get(source_file))
+                        if location:
+                            page_num = location["page_num"] + 1
+                            st.caption(f"Page {page_num} of {source_file}")
+
+                    if st.button(
+                        "View Source",
+                        key=f"view_conflict_{idx}_{label}",
+                        disabled=not can_locate,
+                        help="Open the exact PDF page and highlight this statement"
+                        if can_locate else "No PDF / source quote available for this statement",
+                        use_container_width=True,
+                    ):
+                        request_pdf_view(source_file, quote, f"Conflict {idx} — Statement {label} ({conflict_type})")
+                        st.rerun()
+
+            st.markdown(f"**Recommended action:** {c.get('recommendation', '')}")
+
+# ============================================================
 # RENDER: Checklist (collapsible reason/evidence per item)
 # ============================================================
 def render_checklist_section(checklist, theme):
@@ -581,11 +884,23 @@ def render_checklist_section(checklist, theme):
         cat = item.get('category', 'Other')
         categories.setdefault(cat, []).append(item)
 
+    def _status_counts(items):
+        go = sum(1 for i in items if i.get('status') == 'GO')
+        nogo = sum(1 for i in items if i.get('status') == 'NO-GO')
+        cond = sum(1 for i in items if i.get('status') not in ('GO', 'NO-GO'))
+        return go, nogo, cond
+
     for category, items in categories.items():
+        dept_go, dept_nogo, dept_cond = _status_counts(items)
         st.markdown(f"""
         <div class="rfp-card">
             <div class="rfp-card-title">{category} Department</div>
             <div class="rfp-card-sub">{len(items)} item(s) evaluated</div>
+            <div style="margin-top:8px; display:flex; flex-wrap:wrap; gap:6px;">
+                <span class="status-pill status-go">GO: {dept_go}</span>
+                <span class="status-pill status-nogo">NO-GO: {dept_nogo}</span>
+                <span class="status-pill status-escalate">CONDITIONAL: {dept_cond}</span>
+            </div>
         </div>
         """, unsafe_allow_html=True)
 
@@ -693,6 +1008,79 @@ def render_compliance_table_section(compliance, theme, max_rows=6, max_chars=70)
 
     if overflow_notes:
         st.caption("Additional tasks not shown here (see full JSON download): " + "; ".join(overflow_notes))
+
+# ============================================================
+# RENDER: Certification Navigator (required vs. recommended certs)
+# ============================================================
+def render_faq_section(faqs):
+    if not faqs:
+        st.info("No FAQ content was generated for this analysis.")
+        return
+    st.caption("Standard questions a client or reviewer commonly asks about an RFP, answered from this document where possible.")
+    for i, faq in enumerate(faqs, 1):
+        with st.expander(f"{i}. {faq.get('question', '')}"):
+            st.markdown(faq.get('answer', ''))
+
+
+def render_certifications_section(certifications, theme):
+    if not certifications:
+        st.success("No specific certifications, licenses, or accreditations were identified as required or advantageous for this RFP.")
+        return
+
+    required = [c for c in certifications if c.get('type') == 'Required']
+    recommended = [c for c in certifications if c.get('type') == 'Recommended']
+
+    if required:
+        st.error(f"{len(required)} certification(s) appear to be REQUIRED for eligibility.")
+    if recommended:
+        st.info(f"{len(recommended)} certification(s) would make this proposal more competitive.")
+
+    if required:
+        st.markdown("##### Required for Eligibility")
+        for cert in required:
+            with st.expander(f"{cert.get('name', '')}"):
+                st.markdown(f"**Why:** {cert.get('reason', '')}")
+                st.caption(f"Reference: {cert.get('section_ref', 'N/A')}")
+
+    if recommended:
+        st.markdown("##### Recommended for Competitiveness")
+        for cert in recommended:
+            with st.expander(f"{cert.get('name', '')}"):
+                st.markdown(f"**Why:** {cert.get('reason', '')}")
+                st.caption(f"Reference: {cert.get('section_ref', 'N/A')}")
+
+# ============================================================
+# RENDER: Executive Summaries (persona-tuned tabs)
+# ============================================================
+def render_executive_summaries_section(exec_summaries, theme):
+    if not exec_summaries or not any((exec_summaries or {}).values()):
+        st.warning(
+            "This analysis doesn't have executive summaries yet — it was likely run "
+            "before this feature was added. Scroll down to **'Add More Files to This "
+            "Analysis'** and click **'Add Files & Re-run Analysis'** (you can re-upload "
+            "the same file) to regenerate it with executive summaries and conflict "
+            "detection included, or start a **'Process New Document'** run."
+        )
+        return
+
+    personas = [("ceo", "CEO"), ("cfo", "CFO"), ("technical", "Technical")]
+
+    cols = st.columns(3)
+    for col, (key, label) in zip(cols, personas):
+        state_key = f"show_exec_{key}"
+        if state_key not in st.session_state:
+            st.session_state[state_key] = False
+        with col:
+            is_open = st.session_state[state_key]
+            if st.button(f"{'Hide' if is_open else 'View'} {label}", key=f"toggle_exec_{key}", use_container_width=True):
+                st.session_state[state_key] = not is_open
+                st.rerun()
+
+    for key, label in personas:
+        if st.session_state.get(f"show_exec_{key}"):
+            st.markdown(f"**{label} View**")
+            st.markdown(exec_summaries.get(key, 'Not available.'))
+            st.markdown("")
 
 # ============================================================
 # PDF GENERATION FUNCTIONS (downloadable reports)
@@ -811,6 +1199,52 @@ def generate_full_results_pdf(results, file_name=None):
     story.append(Paragraph("<b>Project Summary</b>", styles['Heading2']))
     story.append(Paragraph(summary, summary_style))
     story.append(Spacer(1, 10))
+
+    exec_summaries = results.get('executive_summaries', {})
+    if exec_summaries and any(exec_summaries.values()):
+        story.append(Paragraph("<b>Executive Summary — By Audience</b>", styles['Heading2']))
+        persona_labels = [
+            ("ceo", "For the CEO"),
+            ("cfo", "For the CFO"),
+            ("technical", "For the Technical Lead"),
+        ]
+        for key, label in persona_labels:
+            text = exec_summaries.get(key)
+            if not text:
+                continue
+            story.append(Paragraph(label, styles['Heading3']))
+            story.append(Paragraph(text, summary_style))
+        story.append(Spacer(1, 10))
+
+    conflicts = results.get('conflicts', [])
+    conflict_summary = results.get('conflict_summary', '')
+    if conflict_summary or conflicts:
+        story.append(Paragraph("<b>Conflict &amp; Contradiction Check</b>", styles['Heading2']))
+        if conflict_summary:
+            story.append(Paragraph(f"<i>{conflict_summary}</i>", styles['Normal']))
+            story.append(Spacer(1, 6))
+        for i, c in enumerate(conflicts, 1):
+            severity = c.get('severity', 'Medium')
+            sev_color = {'High': '#dc3545', 'Medium': '#ffc107', 'Low': '#28a745'}.get(severity, '#ffc107')
+            story.append(Paragraph(
+                f"{i}. <font color='{sev_color}'><b>[{severity}]</b></font> {c.get('type', 'Conflict')} — {c.get('description', '')}",
+                styles['Normal']
+            ))
+            stmt_a = c.get('statement_a', {}) or {}
+            stmt_b = c.get('statement_b', {}) or {}
+            story.append(Paragraph(
+                f"&nbsp;&nbsp;&nbsp;&nbsp;A ({stmt_a.get('section_ref', 'N/A')}, {stmt_a.get('source_file', 'Unknown')}): "
+                f"\"{stmt_a.get('quote') or stmt_a.get('text', '')}\"",
+                styles['Normal']
+            ))
+            story.append(Paragraph(
+                f"&nbsp;&nbsp;&nbsp;&nbsp;B ({stmt_b.get('section_ref', 'N/A')}, {stmt_b.get('source_file', 'Unknown')}): "
+                f"\"{stmt_b.get('quote') or stmt_b.get('text', '')}\"",
+                styles['Normal']
+            ))
+            story.append(Paragraph(f"&nbsp;&nbsp;&nbsp;&nbsp;<i>Recommended action: {c.get('recommendation', '')}</i>", styles['Normal']))
+            story.append(Spacer(1, 6))
+        story.append(Spacer(1, 8))
 
     go_no_go = results.get('go_no_go', {})
     if go_no_go:
@@ -962,6 +1396,23 @@ def generate_full_results_pdf(results, file_name=None):
                 story.append(Paragraph(f"- {task}", styles['Normal']))
             story.append(Spacer(1, 5))
 
+    certifications = results.get('certifications', [])
+    if certifications:
+        story.append(Spacer(1, 10))
+        story.append(Paragraph("<b>Certification Navigator</b>", styles['Heading2']))
+        for cert in certifications:
+            cert_type = cert.get('type', 'Recommended')
+            color = '#dc3545' if cert_type == 'Required' else '#d8a23a'
+            story.append(Paragraph(
+                f"<font color='{color}'><b>[{cert_type}]</b></font> {cert.get('name', '')}",
+                styles['Normal']
+            ))
+            story.append(Paragraph(cert.get('reason', ''), styles['Normal']))
+            section_ref = cert.get('section_ref', 'N/A')
+            if section_ref and section_ref != 'N/A':
+                story.append(Paragraph(f"<i>Reference: {section_ref}</i>", styles['Normal']))
+            story.append(Spacer(1, 6))
+
     footer_style = ParagraphStyle(
         'Footer', parent=styles['Normal'], fontSize=8,
         textColor=colors.HexColor('#999999'), alignment=TA_CENTER, spaceBefore=20
@@ -1021,14 +1472,20 @@ def main():
         1. Upload one or multiple files (PDF, DOCX, TXT)
         2. OR paste text below
         3. Click "Process Document"
-        4. View the Go/No-Go decision with detailed checklist
-        5. Click **View Source** next to any deliverable to jump to its exact page, highlighted
-        6. Scroll to **Functional / Non-Functional Requirements** to see the classification
+        4. View the Go/No-Go decision, then Project Summary and Executive Summary
+        5. Click any section heading below to expand its details — Deliverables, Evaluation Criteria, Certifications, Checklist, Conflicts
+        6. Click **View Source** next to any deliverable or conflict to jump to its exact page, highlighted
         """)
 
         st.markdown("---")
         st.subheader("Fetch Analysis by ID")
-        fetch_id = st.text_input("Enter Analysis ID:", placeholder="e.g., RFP-20260727-a1b2c3d4")
+        if 'fetch_id_input' not in st.session_state:
+            st.session_state['fetch_id_input'] = ''
+        fetch_id = st.text_input(
+            "Enter Analysis ID:",
+            placeholder="e.g., RFP-20260727-a1b2c3d4",
+            key="fetch_id_input"
+        )
         if st.button("Fetch Results", use_container_width=True):
             if fetch_id:
                 if load_analysis_into_session(fetch_id):
@@ -1039,22 +1496,29 @@ def main():
 
         st.markdown("---")
         st.subheader("Saved Analyses")
+        st.caption("Click an ID to copy it into the box above, then press Fetch Results.")
+
+        def _copy_id_to_fetch_box(aid):
+            st.session_state['fetch_id_input'] = aid
+
         saved_ids = get_all_analysis_ids()
         if saved_ids:
             recent_ids = saved_ids[-5:][::-1]
             older_ids = saved_ids[:-5][::-1]
 
             for aid in recent_ids:
-                if st.button(aid, key=f"saved_id_{aid}", use_container_width=True):
-                    if load_analysis_into_session(aid):
-                        st.rerun()
+                st.button(
+                    aid, key=f"saved_id_{aid}", use_container_width=True,
+                    on_click=_copy_id_to_fetch_box, args=(aid,)
+                )
 
             if older_ids:
                 with st.expander(f"Show {len(older_ids)} more"):
                     for aid in older_ids:
-                        if st.button(aid, key=f"saved_id_more_{aid}", use_container_width=True):
-                            if load_analysis_into_session(aid):
-                                st.rerun()
+                        st.button(
+                            aid, key=f"saved_id_more_{aid}", use_container_width=True,
+                            on_click=_copy_id_to_fetch_box, args=(aid,)
+                        )
         else:
             st.caption("No saved analyses yet.")
 
@@ -1114,7 +1578,7 @@ def main():
                     processor = RFPProcessor(api_key)
                     pdf_raw_pages = {}
 
-                    with st.spinner(f"Processing {len(uploaded_files)} document(s) with Gemini (6 agents running in parallel)..."):
+                    with st.spinner(f"Processing {len(uploaded_files)} document(s) with Gemini (4 agents running in parallel)..."):
                         for idx, file_path in enumerate(file_paths):
                             text = processor.extract_text(file_path)
                             file_label = file_name_list[idx]
@@ -1177,7 +1641,7 @@ def main():
                 try:
                     processor = RFPProcessor(api_key)
 
-                    with st.spinner("Processing text with Gemini (6 agents running in parallel)..."):
+                    with st.spinner("Processing text with Gemini (4 agents running in parallel)..."):
                         results = processor.run_full_analysis(pasted_text)
 
                         analysis_id = generate_analysis_id()
@@ -1210,17 +1674,152 @@ def main():
                 st.rerun()
             return
 
-        st.markdown("---")
-        st.subheader("Go/No-Go Decision Dashboard")
-        render_go_no_go_dashboard(results.get('go_no_go', {}), theme)
+        # ------------------------------------------------------------
+        # Surface any per-agent errors that were baked into this SAVED
+        # analysis at generation time (e.g. a rate-limit hit while this
+        # was originally run). This is historical data read from disk --
+        # loading/fetching a saved analysis never calls Gemini -- so it
+        # does NOT mean today's API key is broken. Offer a one-click way
+        # to regenerate with the current key instead of re-uploading.
+        # ------------------------------------------------------------
+        agent_meta_preview = results.get('_agent_meta', {})
+        agent_errors_preview = agent_meta_preview.get('errors', {})
+        if agent_errors_preview:
+            is_rate_limit = any(
+                '429' in str(err) or 'quota' in str(err).lower() or 'rate limit' in str(err).lower()
+                for err in agent_errors_preview.values()
+            )
+            with st.container(border=True):
+                if is_rate_limit:
+                    st.warning(
+                        "This saved analysis has one or more sections that fell back to a "
+                        "default value because of an API rate limit / quota error **at the time "
+                        "it was originally generated.** Fetching a saved analysis never calls "
+                        "Gemini, so this is historical data, not a sign your current API key is "
+                        "broken -- it's just replaying what was saved."
+                    )
+                else:
+                    st.warning(
+                        "This saved analysis has one or more sections that fell back to a "
+                        "default value due to an error at the time it was originally generated."
+                    )
+                affected = ", ".join(agent_errors_preview.keys())
+                st.caption(f"Affected section(s): {affected}")
 
-        st.markdown("---")
-        st.markdown("#### Checklist Evaluation")
-        st.caption("Click any item to see the reasoning and RFP evidence behind its decision.")
-        render_checklist_section(results.get('go_no_go', {}).get('checklist', []), theme)
+                combined_text_for_regen = st.session_state.get('combined_text', '')
+                if combined_text_for_regen:
+                    if st.button("Regenerate This Analysis With Current API Key", key="regen_analysis_btn"):
+                        if not api_key:
+                            st.error("Please provide your Gemini API key in the sidebar")
+                        else:
+                            try:
+                                with st.spinner("Re-running analysis with your current API key..."):
+                                    processor = RFPProcessor(api_key)
+                                    new_results = processor.run_full_analysis(combined_text_for_regen)
+                                    save_analysis_results(
+                                        analysis_id, new_results,
+                                        st.session_state.get('pdf_files_bytes', {}),
+                                        st.session_state.get('pdf_raw_pages', {}),
+                                        combined_text_for_regen,
+                                    )
+                                    st.session_state['results'] = new_results
+                                    clear_pdf_view()
+                                st.success(f"Analysis regenerated under the same Analysis ID: `{analysis_id}`")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Error while regenerating: {str(e)}")
+                else:
+                    st.caption(
+                        "The original source text for this analysis isn't available in this "
+                        "session, so it can't be regenerated automatically -- re-upload the "
+                        "original file(s) instead."
+                    )
+
+        with _bordered_container():
+            st.markdown('<div class="section-header-bar">Go/No-Go Decision Dashboard</div>', unsafe_allow_html=True)
+            render_go_no_go_dashboard(results.get('go_no_go', {}), theme)
+
+        with _bordered_container():
+            st.markdown('<div class="section-header-bar">Project Summary</div>', unsafe_allow_html=True)
+            st.info(results.get('project_summary', 'No summary available'))
+
+        with _bordered_container():
+            st.markdown('<div class="section-header-bar">Executive Summary — By Audience</div>', unsafe_allow_html=True)
+            st.caption("Click a tag below to open that stakeholder's summary.")
+            render_executive_summaries_section(results.get('executive_summaries', {}), theme)
+
+        st.markdown("### Details — click any section below to expand")
+        st.caption("Each card below shows a quick-glance summary in its heading. Click **View Details** to open it, and **Hide** to collapse it again.")
+
+        deliverables = results.get('deliverables', [])
+        pdf_files_bytes = st.session_state.get('pdf_files_bytes', {})
+        pdf_raw_pages = st.session_state.get('pdf_raw_pages', {})
+        source_files_available = set(pdf_files_bytes.keys())
+        main_count, sub_count = _deliverable_counts(deliverables)
+        deliverables_badge = (
+            f'<span class="rfp-badge">Total: {sub_count}</span> '
+            f'<span class="rfp-badge">Categories: {main_count}</span> '
+            f'<span class="rfp-badge">Items: {sub_count}</span>'
+        )
+
+        def _render_deliverables_body():
+            render_deliverables(deliverables, source_files_available, pdf_files_bytes, pdf_raw_pages)
+            render_pdf_viewer(theme)
+
+        render_collapsible_section(
+            "deliverables", "Deliverables Required by RFP",
+            _render_deliverables_body, badge_html=deliverables_badge
+        )
+
+        render_collapsible_section(
+            "eval_criteria", "Evaluation Criteria",
+            lambda: render_evaluation_criteria_section(results.get('evaluation_criteria', []), theme)
+        )
+
+        certifications = results.get('certifications', [])
+        render_collapsible_section(
+            "certifications", "Certification Navigator",
+            lambda: render_certifications_section(certifications, theme),
+            badge_html=_certification_badge(certifications) if certifications else ""
+        )
+
+        go_no_go_data = results.get('go_no_go', {})
+        render_collapsible_section(
+            "checklist", "Checklist Evaluation",
+            lambda: render_checklist_section(go_no_go_data.get('checklist', []), theme),
+            badge_html=render_go_no_go_status_badge(go_no_go_data)
+        )
+
+        conflicts = results.get('conflicts', [])
+        conflict_summary = results.get('conflict_summary', '')
+
+        def _render_conflicts_body():
+            st.caption(
+                "The AI scans the RFP for internal contradictions — mismatched dates, "
+                "conflicting deliverable/scope descriptions, inconsistent financial terms, "
+                "and similar issues — so they can be clarified with the client before submission."
+            )
+            render_conflicts_section(
+                conflicts, conflict_summary, theme,
+                pdf_files_bytes=pdf_files_bytes, pdf_raw_pages=pdf_raw_pages,
+            )
+
+        render_collapsible_section(
+            "conflicts", "Conflict & Contradiction Check",
+            _render_conflicts_body,
+            badge_html=_conflict_badge(conflicts) if conflicts else ""
+        )
+
+        faqs = results.get('faqs', [])
+        render_collapsible_section(
+            "faqs", "Frequently Asked Questions",
+            lambda: render_faq_section(faqs),
+            badge_html=f'<span class="rfp-badge">{len(faqs)} Questions</span>' if faqs else ""
+        )
 
         agent_meta = results.get('_agent_meta')
         if agent_meta:
+            st.markdown("---")
             with st.expander("Multi-Agent Pipeline Performance", expanded=False):
                 total_time = agent_meta.get('total_elapsed_seconds', 0)
                 per_agent = agent_meta.get('per_agent_seconds', {})
@@ -1235,11 +1834,10 @@ def main():
                         f"Running in parallel saved ~{max(0, sum_sequential - total_time):.1f}s."
                     )
                     agent_labels = {
-                        "summary": "Summary Agent",
+                        "summary": "Summary Agent (project summary + executive summaries)",
                         "deliverables": "Deliverables Agent",
-                        "evaluation_criteria": "Evaluation Criteria Agent",
-                        "compliance_checklist": "Compliance Checklist Agent",
-                        "go_no_go": "Go/No-Go Agent",
+                        "extraction": "Extraction Agent (evaluation criteria + compliance checklist + certifications)",
+                        "risk": "Risk Agent (go/no-go + conflict check)",
                     }
                     for agent_name, seconds in per_agent.items():
                         status = "error (used fallback)" if agent_name in errors else "succeeded"
@@ -1249,27 +1847,6 @@ def main():
                     st.warning("Some agents fell back to default values after an error:")
                     for agent_name, err in errors.items():
                         st.caption(f"{agent_name}: {err}")
-
-        st.markdown("---")
-        st.subheader("Project Summary")
-        st.info(results.get('project_summary', 'No summary available'))
-
-        st.subheader("Deliverables Required by RFP")
-        deliverables = results.get('deliverables', [])
-
-        pdf_files_bytes = st.session_state.get('pdf_files_bytes', {})
-        source_files_available = set(pdf_files_bytes.keys())
-
-        render_deliverables(deliverables, source_files_available)
-        render_pdf_viewer(theme)
-
-        st.markdown("---")
-        st.subheader("Evaluation Criteria")
-        render_evaluation_criteria_section(results.get('evaluation_criteria', []), theme)
-
-        st.markdown("---")
-        st.subheader("Compliance Checklist")
-        render_compliance_table_section(results.get('compliance_checklist', {}), theme)
 
         st.markdown("---")
         st.subheader("Add More Files to This Analysis")
@@ -1398,7 +1975,7 @@ def main():
                 use_container_width=True
             )
         with col2:
-            if st.button("Process New Document", use_container_width=True):
+            if st.button("Process New Document", use_container_width=True, type="primary"):
                 st.session_state['processed'] = False
                 st.session_state['results'] = None
                 st.session_state['pdf_files_bytes'] = {}

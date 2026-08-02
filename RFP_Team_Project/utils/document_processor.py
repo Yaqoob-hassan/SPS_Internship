@@ -14,7 +14,7 @@ from typing import Dict, Any, List, Optional
 # collapsed, punctuation stripped) which would break exact text search.
 import fitz
 
-# 🆕 Multi-agent pipeline: splits analysis into independent, single-responsibility
+# Multi-agent pipeline: splits analysis into independent, single-responsibility
 # agents (summary / deliverables / evaluation criteria / compliance / go-no-go)
 # run concurrently instead of one large sequential prompt.
 from utils.agents import run_agents_parallel
@@ -23,29 +23,85 @@ from utils.agents import run_agents_parallel
 class RFPProcessor:
     """Handles document extraction and AI analysis for RFP documents"""
 
+    # Preferred, in order. Each Gemini model has its OWN separate daily/per-minute
+    # quota bucket, so if one runs out (or has zero allocation on this account),
+    # run_agents_parallel automatically fails over to the next one in this list.
+    # gemini-2.5-flash first: confirmed to have real free-tier quota on accounts
+    # we've tested against, unlike gemini-2.0-flash which returned "limit: 0"
+    # (a permanent zero allocation, not a used-up quota) on at least one account.
+    PREFERRED_MODELS = [
+        "models/gemini-2.5-flash",
+        "models/gemini-flash-latest",
+        "models/gemini-2.5-flash-lite",
+        "models/gemini-2.0-flash",
+        "models/gemini-2.0-flash-001",
+        "models/gemini-2.0-flash-lite",
+    ]
+
     def __init__(self, api_key: str):
         """Initialize with Gemini API key"""
         genai.configure(api_key=api_key)
 
-        # Auto-select first available model
+        available = {
+            model.name for model in genai.list_models()
+            if 'generateContent' in model.supported_generation_methods
+        }
+
         self.model = None
-        for model in genai.list_models():
-            if 'generateContent' in model.supported_generation_methods:
-                self.model = genai.GenerativeModel(model.name)
-                print(f"✅ Using model: {model.name}")
-                break
+        self.models = []
+
+        # 8192 was too tight for the Extraction agent specifically -- it packs
+        # THREE sub-tasks (evaluation criteria + a 5-department compliance
+        # checklist + a certifications list with per-item reasoning) into one
+        # JSON response, so it's by far the most verbose of the four agents.
+        # Under the old 8192 cap, Gemini's response got cut off mid-JSON on
+        # anything but a short RFP, which is exactly what produced errors
+        # like "Expecting value: line 17 column 116" -- json.loads hitting
+        # the point where the text just stops. gemini-2.5-flash supports up
+        # to 65536 output tokens, so 32768 gives every agent generous
+        # headroom without being wasteful.
+        generation_config = genai.GenerationConfig(
+            max_output_tokens=32768,
+            response_mime_type="application/json",
+        )
+
+        # Build a model object for EVERY preferred model this key actually has
+        # access to (in preference order), not just the first match. Different
+        # Gemini models draw from separate quota buckets, and -- as we learned
+        # the hard way -- some Google accounts have a free-tier allocation of
+        # exactly ZERO for a given model (not "exhausted", just never granted).
+        # Keeping the full list lets run_agents_parallel automatically skip a
+        # model the instant it hits a permanent zero-quota wall, instead of the
+        # whole app getting stuck on whichever model happened to be picked first.
+        ordered_available = [m for m in self.PREFERRED_MODELS if m in available]
+        if not ordered_available and available:
+            ordered_available = sorted(available)
+
+        for name in ordered_available:
+            try:
+                self.models.append(genai.GenerativeModel(name, generation_config=generation_config))
+            except Exception:
+                try:
+                    self.models.append(genai.GenerativeModel(name))
+                except Exception:
+                    continue
+
+        if self.models:
+            self.model = self.models[0]  # kept for any legacy code that still reads self.model directly
+            print(f"Model fallback chain ({len(self.models)}): {', '.join(ordered_available)}")
 
         if self.model is None:
             raise Exception("No available Gemini model found.")
 
     def run_full_analysis(self, text: str) -> Dict[str, Any]:
         """
-        🆕 Multi-agent analysis pipeline.
+        Multi-agent analysis pipeline.
 
-        Runs SummaryAgent, DeliverablesAgent, EvaluationCriteriaAgent,
-        ComplianceChecklistAgent, and GoNoGoAgent CONCURRENTLY (thread pool)
-        instead of the old approach of one big analyze_rfp() call followed by
-        a separate sequential go_no_go_analysis() call.
+        Runs SummaryAgent, DeliverablesAgent, ExtractionAgent, and RiskAgent
+        CONCURRENTLY (thread pool) -- 4 total requests, kept intentionally
+        under Gemini's free-tier 5-requests/minute ceiling -- instead of the
+        old approach of one big analyze_rfp() call followed by a separate
+        sequential go_no_go_analysis() call.
 
         Returns the same shape the app already expects:
             {project_summary, deliverables, evaluation_criteria,
@@ -58,7 +114,7 @@ class RFPProcessor:
         (unused by this method) in case you want the old single-call behavior
         for comparison or as a fallback.
         """
-        return run_agents_parallel(self.model, text)
+        return run_agents_parallel(self.models, text)
 
     def extract_text_from_pdf(self, file_path: str) -> str:
         text = ""
@@ -346,7 +402,7 @@ class RFPProcessor:
                 result['checklist'] = []
 
             # ============================================================
-            # ✅ CALCULATE SCORE ONLY FROM CHECKLIST ITEMS
+            # CALCULATE SCORE ONLY FROM CHECKLIST ITEMS
             # ============================================================
             total_score = 0
             max_score = len(result.get('checklist', [])) * 10
@@ -400,7 +456,7 @@ class RFPProcessor:
 
 
 # ============================================================
-# 🆕 "VIEW IN PDF" HELPERS (module-level, no Gemini/API key needed)
+# "VIEW IN PDF" HELPERS (module-level, no Gemini/API key needed)
 # ============================================================
 # These are standalone so the Streamlit app can open/search/highlight a PDF
 # without spinning up an RFPProcessor (which requires a valid Gemini key and

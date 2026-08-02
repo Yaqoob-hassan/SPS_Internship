@@ -1,0 +1,16 @@
+# Environment variables
+.env
+*.env
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environment
+.venv/
+
+# Analysis outputs
+RFP_Team_Project/analysis_results/
+
+# Logs
+*.log
