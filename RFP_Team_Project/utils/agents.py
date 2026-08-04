@@ -50,7 +50,10 @@ Why this shape beats one giant prompt:
                       section(s) -- the rest of the analysis still succeeds.
   - Resilient:        every model call retries on 429 with Google's own
                       suggested backoff, and fails over across the model
-                      list on a permanent zero-quota error.
+                      list on a permanent zero-quota error, AND now also
+                      on any other per-model error (see _call_model_with_retry
+                      below) -- e.g. a specific model rejecting the JSON
+                      response schema no longer kills the whole call.
 
 ────────────────────────────────────────────────────────────────────────
 DOUBLE VERIFICATION (new): catching AI mistakes before they reach the user
@@ -83,6 +86,64 @@ actually matters for the decision, and split into two tiers:
   verified item is tagged "verified": true/false so the UI can surface this
   later if desired, and any go/no-go score/decision/counts affected by a
   correction are recalculated from the corrected checklist.
+
+────────────────────────────────────────────────────────────────────────
+DECISION REASONING (new): explaining WHY the Go/No-Go decision came out
+the way it did
+────────────────────────────────────────────────────────────────────────
+Previously the checklist showed a per-item "reason" for each individual
+checklist item, but the overall GO / NO-GO / CONDITIONAL decision itself
+had no single, specific explanation tying it back to which items actually
+drove it. `_build_decision_reason()` below builds that explanation
+directly from the (possibly AI-double-checked and corrected) checklist
+every time `_recompute_go_no_go_scores()` runs -- so it always reflects
+the CURRENT checklist, including any corrections applied by the
+verification pass, rather than a static blurb that could go stale after
+a correction changes the decision.
+
+────────────────────────────────────────────────────────────────────────
+SPEED OPTIMIZATION: CONCURRENT AGENT EXECUTION (the parallel fix)
+────────────────────────────────────────────────────────────────────────
+The four extraction agents (Summary, Deliverables, Extraction, Risk) each
+need their own separate call to Gemini. The slow way to do this is to call
+them one after another and just add up their times -- if each agent takes
+about 8 seconds, that's 32 seconds of waiting before the user sees
+anything.
+
+Instead, all four agents are fired at the same time using a
+ThreadPoolExecutor (Python's built-in thread pool). Each agent's
+generate_content() call is a network request, and while one agent is
+waiting on Gemini to respond, the other three can be waiting on their own
+requests at the same time instead of sitting idle. The code submits all
+four agent calls together, then collects each result as it finishes with
+as_completed() -- it doesn't force them to finish in a fixed order, so a
+fast agent's result is used the moment it's ready instead of being stuck
+behind a slower one.
+
+The practical effect: total wall-clock time is roughly however long the
+SLOWEST single agent takes, not the sum of all four. So instead of
+"8 + 8 + 8 + 8 = 32 seconds", the analysis finishes in roughly "8 seconds"
+-- close to a 4x speedup for free, just by not waiting around one at a
+time.
+
+The same idea is reused for embeddings: when a document is large enough to
+need multiple embedding batches (RAG), those batches are also submitted to
+a thread pool and run concurrently instead of one-by-one, so building the
+retrieval index doesn't add several sequential round-trips of pure waiting
+before the agents can even start.
+
+How this behaves when things get busy: this app deliberately stays under
+Gemini's free-tier limit of 5 requests per minute (4 agents + 1
+verification pass = 5 calls per analysis), so under normal load there's no
+queuing -- every agent just runs immediately, in parallel. If the API DOES
+get overloaded or hits a rate limit anyway, the pipeline doesn't crash --
+each call automatically retries with the wait time Google itself suggests,
+and if a specific model is completely out of quota it fails over to the
+next model in the list. So under heavy load the system slows down
+gracefully (a few extra seconds of retry/backoff) rather than breaking,
+and one agent having trouble never blocks or corrupts the other three --
+each agent's success or failure is fully independent.
+
 """
 
 import json
@@ -95,7 +156,7 @@ from typing import Dict, Any, List, Optional, Tuple, Union
 import google.generativeai as genai
 
 print("=" * 60)
-print("agents.py LOADED — VERSION: rag-v1 + verification-v1")
+print("agents.py LOADED — VERSION: rag-v1 + verification-v2 + decision-reason-v1 (resilient fallback)")
 print("   (if you don't see this line on every app restart,")
 print("    Python is running a stale/cached copy of this file)")
 print("=" * 60)
@@ -228,9 +289,24 @@ def _call_model_with_retry(models, prompt: str, max_retries_per_model: int = 3):
     Call generate_content() against a LIST of models (in preference order),
     automatically retrying on a normal 429 rate limit with the backoff Google
     itself suggests, and automatically failing over to the next model in the
-    list on a permanent zero-quota error or once retries on the current model
-    are exhausted. Non-rate-limit, non-quota errors raise immediately --
-    no point retrying a bad prompt or a genuine auth failure.
+    list on:
+      - a permanent zero-quota error,
+      - exhausted retries on a rate limit,
+      - OR any other per-model error (e.g. a model rejecting the requested
+        JSON response schema, an invalid-argument error, a transient
+        network blip, etc).
+
+    CHANGED (fix): previously a non-rate-limit / non-zero-quota error was
+    re-raised immediately, which meant a SINGLE incompatible or flaky model
+    anywhere in the list could fail the entire call even though later
+    models in the fallback chain might have handled it fine. This was the
+    root cause of the verification pass intermittently showing
+    "Unavailable" -- it reorders the model list to try '*-lite' models
+    first (see _prefer_lite_models), and if that lite model raised any
+    non-quota error, the whole verification call died right there instead
+    of trying the next model. Now every error type still gives the next
+    model in the chain a chance; only after every model has been tried
+    does this raise the last error encountered.
     """
     if not isinstance(models, (list, tuple)):
         models = [models]
@@ -245,9 +321,13 @@ def _call_model_with_retry(models, prompt: str, max_retries_per_model: int = 3):
             except Exception as e:
                 last_error = e
                 if _is_zero_quota_error(e):
-                    break  # this model will never work on this account -- move on
+                    break  # this model will never work on this account -- move to the next one
                 if not _is_rate_limit_error(e):
-                    raise  # a real bug/auth error -- don't waste time retrying it
+                    # Not a quota/rate-limit issue (e.g. a model-specific
+                    # incompatibility). Don't burn retries on THIS model,
+                    # but still fall through to the next model in the chain
+                    # instead of failing the whole call outright.
+                    break
                 if attempt == max_retries_per_model - 1:
                     break  # exhausted retries on this model's own rate limit -- try the next one
                 time.sleep(_parse_retry_delay_seconds(e))
@@ -336,23 +416,52 @@ def _chunk_text(text: str, size: int = 1400, overlap: int = 200) -> List[str]:
     return chunks
 
 
+def _embed_one_batch(batch: List[str], task_type: str) -> List[List[float]]:
+    result = genai.embed_content(model=EMBED_MODEL, content=batch, task_type=task_type)
+    emb = result["embedding"]
+    if emb and isinstance(emb[0], (int, float)):
+        return [emb]  # a batch of exactly 1 can come back as a flat vector
+    return list(emb)
+
+
 def _embed_texts(texts: List[str], task_type: str, batch_size: int = 100) -> List[List[float]]:
     """
-    Embed a list of texts with Gemini, batched. task_type should be
-    'retrieval_document' for chunks and 'retrieval_query' for queries.
-    Returns one vector per input text. Uses the module-level genai config
-    already set up by RFPProcessor.__init__ (genai.configure(api_key=...)),
-    so no separate auth is needed here.
+    Embed a list of texts with Gemini, batched -- and, when a document is
+    large enough to need MULTIPLE batches (>100 chunks), those batches are
+    fired CONCURRENTLY instead of one after another. This matters because
+    embedding the whole document happens once, up front, before ANY
+    extraction agent can start (agents can only retrieve once the index
+    exists) -- so on a large multi-file RFP, sequential batches used to add
+    several full network round-trips of pure waiting before the parallel
+    agent work even began. Running them concurrently collapses that down to
+    roughly one round-trip's worth of wall-clock time.
+
+    task_type should be 'retrieval_document' for chunks and 'retrieval_query'
+    for queries. Returns one vector per input text, in the same order as the
+    input. Uses the module-level genai config already set up by
+    RFPProcessor.__init__ (genai.configure(api_key=...)), so no separate auth
+    is needed here.
     """
+    if not texts:
+        return []
+
+    batches = [texts[i:i + batch_size] for i in range(0, len(texts), batch_size)]
+    if len(batches) == 1:
+        return _embed_one_batch(batches[0], task_type)
+
+    results: List[Optional[List[List[float]]]] = [None] * len(batches)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(batches))) as executor:
+        future_to_idx = {
+            executor.submit(_embed_one_batch, batch, task_type): idx
+            for idx, batch in enumerate(batches)
+        }
+        for future in concurrent.futures.as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            results[idx] = future.result()
+
     all_emb: List[List[float]] = []
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i:i + batch_size]
-        result = genai.embed_content(model=EMBED_MODEL, content=batch, task_type=task_type)
-        emb = result["embedding"]
-        if emb and isinstance(emb[0], (int, float)):
-            all_emb.append(emb)  # a batch of exactly 1 can come back as a flat vector
-        else:
-            all_emb.extend(emb)
+    for batch_result in results:
+        all_emb.extend(batch_result)
     return all_emb
 
 
@@ -955,6 +1064,74 @@ class ExtractionAgent(BaseAgent):
 # recalculates score/decision/counts the exact same way the original
 # extraction did, rather than duplicating this logic in two places).
 # ============================================================
+def _build_decision_reason(checklist: List[Dict[str, Any]], decision: str) -> str:
+    """
+    Build a specific, human-readable explanation for WHY the overall
+    Go/No-Go decision came out the way it did, grounded directly in the
+    actual checklist items (and their per-item "reason"/"evidence") rather
+    than a generic one-line blurb. This is regenerated every time
+    `_recompute_go_no_go_scores()` runs -- including after the verification
+    pass applies corrections -- so it always reflects the CURRENT state of
+    the checklist instead of going stale.
+    """
+    if not checklist:
+        return "No checklist items were available to base a decision on."
+
+    no_go_items = [i for i in checklist if i.get('status') == 'NO-GO']
+    escalate_items = [i for i in checklist if i.get('status') not in ('GO', 'NO-GO')]
+    go_items = [i for i in checklist if i.get('status') == 'GO']
+
+    def _line(item: Dict[str, Any]) -> str:
+        cat = item.get('category', 'Other')
+        name = item.get('item', 'Unknown item')
+        reason = item.get('reason', '').strip() or 'No reason was provided for this item.'
+        return f"- [{cat}] {name}: {reason}"
+
+    lines: List[str] = []
+
+    if decision == 'NO-GO':
+        lines.append(
+            f"Overall recommendation: NO-GO. This is driven primarily by "
+            f"{len(no_go_items)} checklist item(s) that scored in the failing range (0-2):"
+        )
+        lines.extend(_line(i) for i in no_go_items)
+        if escalate_items:
+            lines.append(
+                f"In addition, {len(escalate_items)} item(s) need management review "
+                f"and would have to be resolved even if the failing item(s) above were addressed:"
+            )
+            lines.extend(_line(i) for i in escalate_items)
+
+    elif decision == 'GO':
+        lines.append(
+            f"Overall recommendation: GO. Out of {len(checklist)} checklist item(s) evaluated, "
+            f"{len(go_items)} fully met our requirements and none scored in the failing range."
+        )
+        if escalate_items:
+            lines.append(
+                f"{len(escalate_items)} item(s) are still worth a closer look before proceeding, "
+                f"though they weren't severe enough to change the overall GO recommendation:"
+            )
+            lines.extend(_line(i) for i in escalate_items)
+
+    else:
+        # CONDITIONAL / ESCALATE / any other non-GO/NO-GO label
+        lines.append(
+            f"Overall recommendation: CONDITIONAL. {len(escalate_items)} checklist item(s) "
+            f"scored in the review range (3-6) and need management sign-off before a final "
+            f"bid decision:"
+        )
+        lines.extend(_line(i) for i in escalate_items)
+        if no_go_items:
+            lines.append(
+                f"Note: {len(no_go_items)} item(s) also scored in the failing range and should "
+                f"be weighed heavily in the final call:"
+            )
+            lines.extend(_line(i) for i in no_go_items)
+
+    return "\n".join(lines)
+
+
 def _recompute_go_no_go_scores(result: Dict[str, Any]) -> Dict[str, Any]:
     checklist = result.get('checklist', [])
     total_score = sum(item.get('score', 0) for item in checklist)
@@ -974,6 +1151,11 @@ def _recompute_go_no_go_scores(result: Dict[str, Any]) -> Dict[str, Any]:
     result['no_go_count'] = sum(1 for i in checklist if i.get('status') == 'NO-GO')
     result['escalate_count'] = sum(1 for i in checklist if i.get('status') == 'ESCALATE')
     result['conditional_count'] = result['escalate_count']
+
+    # NEW: a specific, itemized explanation of WHY this decision was reached,
+    # built from the (possibly-corrected) checklist itself.
+    result['decision_reason'] = _build_decision_reason(checklist, result['overall_decision'])
+
     return result
 
 
@@ -1151,20 +1333,26 @@ class RiskAgent(BaseAgent):
         return result
 
     def fallback(self, error: str) -> Dict[str, Any]:
+        fallback_checklist = [
+            {"category": "Financial", "item": "Payment Terms", "score": 5, "status": "ESCALATE", "reason": "Could not analyze", "evidence": "Check RFP manually"},
+            {"category": "Legal", "item": "Eligibility", "score": 5, "status": "ESCALATE", "reason": "Could not analyze", "evidence": "Check RFP manually"},
+            {"category": "Operations", "item": "Deadlines", "score": 5, "status": "ESCALATE", "reason": "Could not analyze", "evidence": "Check RFP manually"},
+            {"category": "Technical", "item": "Scope", "score": 5, "status": "ESCALATE", "reason": "Could not analyze", "evidence": "Check RFP manually"},
+        ]
         return {
             "overall_decision": "NEEDS REVIEW",
             "overall_score": 50,
-            "checklist": [
-                {"category": "Financial", "item": "Payment Terms", "score": 5, "status": "ESCALATE", "reason": "Could not analyze", "evidence": "Check RFP manually"},
-                {"category": "Legal", "item": "Eligibility", "score": 5, "status": "ESCALATE", "reason": "Could not analyze", "evidence": "Check RFP manually"},
-                {"category": "Operations", "item": "Deadlines", "score": 5, "status": "ESCALATE", "reason": "Could not analyze", "evidence": "Check RFP manually"},
-                {"category": "Technical", "item": "Scope", "score": 5, "status": "ESCALATE", "reason": "Could not analyze", "evidence": "Check RFP manually"},
-            ],
+            "checklist": fallback_checklist,
             "go_count": 0,
             "no_go_count": 0,
             "escalate_count": 4,
             "conditional_count": 4,
             "summary": f"AI analysis encountered an error: {error}. Please review the RFP manually.",
+            "decision_reason": (
+                f"A decision reason could not be generated because the analysis encountered "
+                f"an error: {error}. All checklist items above were set to a neutral ESCALATE "
+                f"score as a placeholder -- please review the RFP manually before bidding."
+            ),
             "conflicts": [],
             "conflict_summary": (
                 "Conflict analysis could not be completed due to an error. "
@@ -1422,6 +1610,33 @@ def _apply_certification_correction(cert: Dict[str, Any], v: Dict[str, Any]) -> 
             cert['reason'] = v['corrected_reason']
 
 
+def _prefer_lite_models(models):
+    """
+    Speed optimization for the verification pass specifically: fact-checking
+    a short list of already-extracted claims against retrieved excerpts is a
+    much simpler task than the original extraction, so it doesn't need the
+    strongest available model. If the account's fallback chain (built in
+    RFPProcessor.__init__ from PREFERRED_MODELS) includes a '*-lite' model,
+    try that FIRST for verification only -- lite models respond meaningfully
+    faster.
+
+    NOTE: this only changes which model _call_model_with_retry tries FIRST.
+    With the resilience fix above, if that lite model errors out for ANY
+    reason (not just quota/rate-limit), the call now falls through to the
+    rest of the chain automatically -- so this reordering can no longer
+    cause verification to fail outright the way it could before. Accounts
+    with no lite model available get the exact same order as before (no
+    behavior change).
+    """
+    if not isinstance(models, (list, tuple)) or not models:
+        return models
+    lite, rest = [], []
+    for m in models:
+        name = getattr(m, "model_name", "") or ""
+        (lite if "lite" in name.lower() else rest).append(m)
+    return lite + rest if lite else list(models)
+
+
 def _run_verification_pass(
     models,
     retriever: DocumentRetriever,
@@ -1437,13 +1652,15 @@ def _run_verification_pass(
 
     If the checklist was touched, the caller is responsible for calling
     _recompute_go_no_go_scores() again afterward -- this function only
-    corrects individual checklist ITEMS, not the aggregate score/decision.
+    corrects individual checklist ITEMS, not the aggregate score/decision
+    (and, as of the decision-reason feature, not the decision_reason text
+    either -- that also gets regenerated by _recompute_go_no_go_scores()).
     """
     start = time.time()
 
     quote_checked, quote_verified = _verify_quotes_programmatically(deliverables, retriever.full_text)
 
-    ai_output = VerificationAgent().run(models, retriever, deliverables, checklist, certifications)
+    ai_output = VerificationAgent().run(_prefer_lite_models(models), retriever, deliverables, checklist, certifications)
     verifications_by_id = {
         v.get('id'): v for v in ai_output.get('verifications', [])
         if isinstance(v, dict) and v.get('id')
@@ -1519,14 +1736,19 @@ def run_agents_parallel(models, text: str) -> Dict[str, Any]:
     entirely and every agent gets the full text, unchanged from before.
 
     `models` is a list of GenerativeModel instances in preference order --
-    each agent call independently fails over down that list on a zero-quota
-    or exhausted-rate-limit error (see _call_model_with_retry).
+    each agent call independently fails over down that list on ANY error
+    (see _call_model_with_retry), not just quota errors.
 
     After the four extraction agents finish, ONE additional verification
     pass runs automatically: it fact-checks deliverables + the go/no-go
     checklist + required certifications against the source text and
     auto-corrects anything unsupported (see "DOUBLE VERIFICATION PASS"
     above). This makes it 5 total model calls per analysis, not 8.
+
+    The final go_no_go dict also includes "decision_reason": a specific,
+    itemized explanation of why the overall GO / NO-GO / CONDITIONAL
+    decision was reached, built from the checklist items that actually
+    drove it (see "DECISION REASONING" above).
     """
     start_time = time.time()
 
@@ -1571,7 +1793,8 @@ def run_agents_parallel(models, text: str) -> Dict[str, Any]:
     verification_meta = _run_verification_pass(models, retriever, deliverables, checklist, certifications)
     if checklist:
         # Corrections may have changed individual item scores/statuses --
-        # recompute the aggregate overall_score/decision/counts to match.
+        # recompute the aggregate overall_score/decision/counts (and the
+        # decision_reason explanation) to match the corrected checklist.
         risk_result = _recompute_go_no_go_scores(risk_result)
 
     total_elapsed = time.time() - start_time

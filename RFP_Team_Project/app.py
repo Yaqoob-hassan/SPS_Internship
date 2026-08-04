@@ -313,6 +313,20 @@ def inject_theme_css(theme: dict):
         color: {theme['text']};
         margin-top: 10px;
     }}
+    .decision-reason-box {{
+        background: rgba(0,0,0,0.03);
+        border-left: 4px solid {theme['card_border']};
+        border-radius: 10px;
+        padding: 12px 16px;
+        margin-top: 14px;
+        text-align: left;
+        font-size: 14px;
+        color: {theme['text']};
+        line-height: 1.5;
+    }}
+    .decision-reason-box b {{
+        color: {theme['accent_dark']};
+    }}
 
     .rfp-table {{
         width: 100%;
@@ -584,6 +598,14 @@ def render_deliverables(deliverables, source_files_available=None, pdf_files_byt
 
             page_tag = f'<span class="rfp-tag-page">Page {page_num}</span>' if page_num else ''
 
+            ai_verified = item.get('verified') if isinstance(item, dict) else None
+            if ai_verified is True:
+                verify_tag = '<span class="status-pill status-go">Verified</span>'
+            elif ai_verified is False:
+                verify_tag = '<span class="status-pill status-escalate">AI-corrected</span>'
+            else:
+                verify_tag = ''
+
             row_col1, row_col2 = st.columns([9, 1])
 
             with row_col1:
@@ -598,6 +620,7 @@ def render_deliverables(deliverables, source_files_available=None, pdf_files_byt
                         <span class="rfp-tag-source">{source_display}</span>
                         <span class="rfp-badge">§ {section_display}</span>
                         {page_tag}
+                        {verify_tag}
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
@@ -720,6 +743,229 @@ def _conflict_badge(conflicts):
 # ============================================================
 # RENDER: Go/No-Go Dashboard (decision card + pie chart)
 # ============================================================
+# ============================================================
+# RENDER: Active Processing Banner (extra, unmissable "system is working"
+# signal shown ALONGSIDE the existing st.spinner text below -- purely
+# additive, never a replacement for it)
+# ============================================================
+def render_active_processing_banner(message: str, theme: dict):
+    """
+    A large animated spinning ring + bold message, rendered in the theme's
+    gold/amber 'escalate' color specifically because that's the most
+    attention-grabbing color already in the palette. This exists purely so
+    the user always has an unmistakable "yes, it's working" signal during a
+    long analysis -- it does NOT replace the st.spinner(...) call that
+    follows it in the code; both are shown together.
+
+    NOTE: callers MUST render this into a st.empty() placeholder and call
+    placeholder.empty() once processing finishes -- st.markdown() calls are
+    permanent elements in the page and are never auto-removed by Streamlit,
+    so without a placeholder this banner would stay on screen forever after
+    the analysis completes (this was the original bug).
+    """
+    gold = theme['escalate']
+    st.markdown(f"""
+    <style>
+    @keyframes rfp-spin {{
+        0% {{ transform: rotate(0deg); }}
+        100% {{ transform: rotate(360deg); }}
+    }}
+    .rfp-processing-banner {{
+        display:flex; align-items:center; gap:14px;
+        background:{theme['card']}; border:2px solid {gold};
+        border-radius:16px; padding:16px 20px; margin: 10px 0 6px 0;
+    }}
+    .rfp-processing-ring {{
+        width:32px; height:32px; border-radius:50%;
+        border:4px solid rgba(216,162,58,0.25);
+        border-top-color: {gold};
+        animation: rfp-spin 0.9s linear infinite;
+        flex-shrink:0;
+    }}
+    .rfp-processing-text {{
+        font-family:'Baloo 2',cursive; font-size:16px; font-weight:700;
+        color:{theme['accent_dark']};
+    }}
+    </style>
+    <div class="rfp-processing-banner">
+        <div class="rfp-processing-ring"></div>
+        <div class="rfp-processing-text">{message}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+# ============================================================
+# RENDER: Processing Trust Banner (big glanceable Speed/RAG/Verified badges)
+# ============================================================
+def render_processing_trust_banner(agent_meta, theme):
+    """
+    The first thing shown once results are ready: three large, icon-led
+    badges answering "was this fast, efficient, and checked?" at a glance,
+    before the user has to read anything or open anything. The detailed
+    AI Double-Check / Efficient Retrieval cards further down give the full
+    breakdown for anyone who wants it -- this banner is the headline.
+    """
+    if not agent_meta:
+        return
+
+    total_time = agent_meta.get('total_elapsed_seconds', 0)
+    per_agent = agent_meta.get('per_agent_seconds', {})
+    retrieval = agent_meta.get('retrieval', {})
+    verification = agent_meta.get('verification', {})
+
+    # --- Speed badge ---
+    sum_sequential = sum(per_agent.values()) + verification.get('elapsed_seconds', 0)
+    time_saved = max(0.0, sum_sequential - total_time)
+    speed_stat = f"{total_time:.1f}s"
+    speed_sub = (
+        f"~{time_saved:.1f}s saved by running agents in parallel"
+        if time_saved > 0.3 else "Optimized multi-agent pipeline"
+    )
+
+    # --- RAG badge ---
+    if retrieval.get('rag_used'):
+        savings_pct = retrieval.get('estimated_token_savings_pct', 0)
+        rag_stat = f"~{savings_pct}%"
+        rag_sub = "fewer tokens used than full-document analysis"
+    else:
+        rag_stat = "Full text"
+        rag_sub = "Document was short enough to skip retrieval"
+
+    # --- Verification badge ---
+    claims_checked = verification.get('claims_checked', 0)
+    corrections = verification.get('corrections_applied', 0)
+    if verification.get('error'):
+        verify_stat = "Unavailable"
+        verify_sub = "Verification pass couldn't complete this run"
+    elif claims_checked == 0:
+        verify_stat = "N/A"
+        verify_sub = "No claims required verification"
+    else:
+        verify_stat = str(claims_checked)
+        verify_sub = f"claims checked · {corrections} corrected" if corrections else "claims checked · all confirmed"
+
+    st.markdown(f"""
+    <div style="display:flex; gap:14px; flex-wrap:wrap; margin: 4px 0 22px 0;">
+        <div style="flex:1; min-width:200px; background:{theme['card']}; border:2px solid {theme['card_border']}; border-radius:16px; padding:18px; text-align:center;">
+            <div style="font-size:28px; line-height:1;">⚡</div>
+            <div style="font-family:'Baloo 2',cursive; font-size:24px; font-weight:700; color:{theme['accent_dark']}; margin-top:6px;">{speed_stat}</div>
+            <div style="font-size:12px; color:{theme['text_muted']}; margin-top:4px;">{speed_sub}</div>
+        </div>
+        <div style="flex:1; min-width:200px; background:{theme['card']}; border:2px solid {theme['card_border']}; border-radius:16px; padding:18px; text-align:center;">
+            <div style="font-size:28px; line-height:1;">🔍</div>
+            <div style="font-family:'Baloo 2',cursive; font-size:24px; font-weight:700; color:{theme['accent_dark']}; margin-top:6px;">{rag_stat}</div>
+            <div style="font-size:12px; color:{theme['text_muted']}; margin-top:4px;">{rag_sub}</div>
+        </div>
+        <div style="flex:1; min-width:200px; background:{theme['card']}; border:2px solid {theme['card_border']}; border-radius:16px; padding:18px; text-align:center;">
+            <div style="font-size:28px; line-height:1;">✅</div>
+            <div style="font-family:'Baloo 2',cursive; font-size:24px; font-weight:700; color:{theme['accent_dark']}; margin-top:6px;">{verify_stat}</div>
+            <div style="font-size:12px; color:{theme['text_muted']}; margin-top:4px;">{verify_sub}</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+# ============================================================
+# RENDER: AI Quality banner (verification results + RAG efficiency)
+# ============================================================
+def render_ai_quality_banner(agent_meta, theme):
+    """
+    Surfaces the two things that were previously only visible inside the
+    'Multi-Agent Pipeline Performance' debug expander: what the AI
+    double-check pass actually found, and how much the RAG retrieval
+    pipeline saved on this analysis. Placed right under the Go/No-Go
+    dashboard so it's the first thing a user sees, not something they have
+    to know to go looking for.
+    """
+    if not agent_meta:
+        return
+
+    verification = agent_meta.get('verification', {})
+    retrieval = agent_meta.get('retrieval', {})
+
+    col_verify, col_rag = st.columns(2)
+
+    with col_verify:
+        claims_checked = verification.get('claims_checked', 0)
+        corrections = verification.get('corrections_applied', 0)
+        verified_ok = verification.get('claims_verified_ok', max(0, claims_checked - corrections))
+        quote_check = verification.get('quote_check', {})
+        quote_checked = quote_check.get('checked', 0)
+        quote_verified = quote_check.get('verified', 0)
+
+        if verification.get('error'):
+            st.markdown(f"""
+            <div class="rfp-card">
+                <div class="rfp-card-title">AI Double-Check</div>
+                <div class="rfp-card-sub" style="margin-top:6px;">
+                    The verification pass couldn't complete for this analysis, so results
+                    below reflect the original extraction, unverified.
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+            # Surface the actual underlying error so this is debuggable instead
+            # of just showing "Unavailable" with no way to know why.
+            with st.expander("Why did verification fail? (debug info)"):
+                st.code(str(verification['error']), language="text")
+        elif claims_checked == 0 and quote_checked == 0:
+            st.markdown(f"""
+            <div class="rfp-card">
+                <div class="rfp-card-title">AI Double-Check</div>
+                <div class="rfp-card-sub" style="margin-top:6px;">
+                    No deliverables, checklist items, or required certifications were
+                    found to verify in this analysis.
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            quote_line = ""
+            if quote_checked:
+                quote_line = (
+                    f'<div class="rfp-card-sub" style="margin-top:8px;">'
+                    f'Source-quote check: {quote_verified}/{quote_checked} deliverable quotes '
+                    f'confirmed as exact matches in the document.</div>'
+                )
+            st.markdown(f"""
+            <div class="rfp-card">
+                <div class="rfp-card-title">AI Double-Check</div>
+                <div class="rfp-card-sub">{claims_checked} claim(s) fact-checked against the source document</div>
+                <div style="margin-top:10px; display:flex; flex-wrap:wrap; gap:6px;">
+                    <span class="status-pill status-go">{verified_ok} confirmed</span>
+                    <span class="status-pill status-escalate">{corrections} corrected</span>
+                </div>
+                {quote_line}
+            </div>
+            """, unsafe_allow_html=True)
+
+    with col_rag:
+        if retrieval.get('rag_used'):
+            savings_pct = retrieval.get('estimated_token_savings_pct', 0)
+            mode = retrieval.get('retrieval_mode', '')
+            mode_label = {
+                "gemini-embeddings": "semantic (AI-embedding) retrieval",
+                "keyword-fallback": "keyword-based retrieval — the embedding service was unavailable, so this analysis used a text-matching fallback instead",
+            }.get(mode, mode)
+            st.markdown(f"""
+            <div class="rfp-card">
+                <div class="rfp-card-title">Efficient Retrieval</div>
+                <div class="rfp-card-sub">Each AI agent only read the parts of the document relevant to its own task, via {mode_label}.</div>
+                <div style="margin-top:10px;">
+                    <span class="status-pill status-go">~{savings_pct}% fewer tokens used vs. sending the full document to every agent</span>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            st.markdown(f"""
+            <div class="rfp-card">
+                <div class="rfp-card-title">Efficient Retrieval</div>
+                <div class="rfp-card-sub" style="margin-top:6px;">
+                    This document was short enough that every agent read it in full —
+                    retrieval wasn't needed to stay efficient.
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+
 def render_go_no_go_dashboard(go_no_go, theme):
     if not go_no_go:
         st.warning("No Go/No-Go analysis available.")
@@ -730,6 +976,9 @@ def render_go_no_go_dashboard(go_no_go, theme):
     go_count = go_no_go.get('go_count', 0)
     no_go_count = go_no_go.get('no_go_count', 0)
     escalate_count = go_no_go.get('escalate_count', 0)
+    # NEW: the item-level "why" explanation built in agents.py
+    # (_build_decision_reason), always in sync with the final checklist.
+    decision_reason = go_no_go.get('decision_reason', 'No detailed reason available for this decision.')
 
     if decision == "GO":
         border_color = theme['go']
@@ -748,6 +997,9 @@ def render_go_no_go_dashboard(go_no_go, theme):
             <div class="decision-title" style="color:{border_color};">{decision}</div>
             <div class="decision-score">Score: {min(100, round(score))} / 100</div>
             <div class="decision-summary">{go_no_go.get('summary', '')}</div>
+            <div class="decision-reason-box">
+                <b>Why this decision:</b> {decision_reason}
+            </div>
         </div>
         """, unsafe_allow_html=True)
 
@@ -915,11 +1167,22 @@ def render_checklist_section(checklist, theme):
             else:
                 status_class, status_label = "status-escalate", status
 
-            with st.expander(f"{item.get('item', 'Unknown')}   [{status_label}]"):
+            ai_verified = item.get('verified')
+            verify_label = ""
+            if ai_verified is True:
+                verify_label = "  [Verified]"
+            elif ai_verified is False:
+                verify_label = "  [AI-corrected]"
+
+            with st.expander(f"{item.get('item', 'Unknown')}   [{status_label}]{verify_label}"):
                 st.markdown(
                     f'<span class="status-pill {status_class}">{status_label}</span>',
                     unsafe_allow_html=True
                 )
+                if ai_verified is True:
+                    st.caption("✓ Confirmed by the AI double-check pass against the source document.")
+                elif ai_verified is False:
+                    st.caption("⚠ This item was corrected by the AI double-check pass after the initial extraction didn't hold up against the source document.")
                 st.markdown(f"**Reason:** {item.get('reason', '')}")
                 st.markdown(f"**Evidence from RFP:** {item.get('evidence', '')}")
 
@@ -1256,6 +1519,11 @@ def generate_full_results_pdf(results, file_name=None):
         story.append(Paragraph(f"<font color='{decision_color}' size='18'><b>{decision}</b></font>", styles['Normal']))
         story.append(Paragraph(f"Score: {min(100, round(score))}/100", styles['Normal']))
         story.append(Paragraph(f"<i>{go_no_go.get('summary', '')}</i>", styles['Normal']))
+        # NEW: item-level decision reason in the downloadable PDF too
+        decision_reason_pdf = go_no_go.get('decision_reason', '')
+        if decision_reason_pdf:
+            story.append(Spacer(1, 4))
+            story.append(Paragraph(f"<b>Why this decision:</b> {decision_reason_pdf}", styles['Normal']))
         story.append(Spacer(1, 10))
 
         go_count = go_no_go.get('go_count', 0)
@@ -1578,6 +1846,11 @@ def main():
                     processor = RFPProcessor(api_key)
                     pdf_raw_pages = {}
 
+                    banner_placeholder = st.empty()
+                    with banner_placeholder.container():
+                        render_active_processing_banner(
+                            f"Working — analyzing {len(uploaded_files)} document(s) with 4 AI agents...", theme
+                        )
                     with st.spinner(f"Processing {len(uploaded_files)} document(s) with Gemini (4 agents running in parallel)..."):
                         for idx, file_path in enumerate(file_paths):
                             text = processor.extract_text(file_path)
@@ -1607,6 +1880,7 @@ def main():
                         st.session_state['pdf_raw_pages'] = pdf_raw_pages
                         clear_pdf_view()
 
+                    banner_placeholder.empty()
                     st.success(f"All {len(uploaded_files)} document(s) processed successfully")
                     st.info(f"Analysis ID: `{analysis_id}`  \nShare this ID to let others fetch the results without re-uploading.")
 
@@ -1641,6 +1915,9 @@ def main():
                 try:
                     processor = RFPProcessor(api_key)
 
+                    banner_placeholder = st.empty()
+                    with banner_placeholder.container():
+                        render_active_processing_banner("Working — analyzing your text with 4 AI agents...", theme)
                     with st.spinner("Processing text with Gemini (4 agents running in parallel)..."):
                         results = processor.run_full_analysis(pasted_text)
 
@@ -1651,6 +1928,7 @@ def main():
                         st.session_state['processed'] = True
                         clear_pdf_view()
 
+                    banner_placeholder.empty()
                     st.success("Document processed successfully")
                     st.info(f"Analysis ID: `{analysis_id}`  \nShare this ID to let others fetch the results without re-uploading.")
                     st.caption("Note: pasted text has no source PDF, so 'View Source' isn't available for these deliverables.")
@@ -1673,6 +1951,8 @@ def main():
                 st.session_state['results'] = None
                 st.rerun()
             return
+
+        render_processing_trust_banner(results.get('_agent_meta', {}), theme)
 
         # ------------------------------------------------------------
         # Surface any per-agent errors that were baked into this SAVED
@@ -1713,6 +1993,9 @@ def main():
                             st.error("Please provide your Gemini API key in the sidebar")
                         else:
                             try:
+                                regen_banner_placeholder = st.empty()
+                                with regen_banner_placeholder.container():
+                                    render_active_processing_banner("Working — regenerating this analysis...", theme)
                                 with st.spinner("Re-running analysis with your current API key..."):
                                     processor = RFPProcessor(api_key)
                                     new_results = processor.run_full_analysis(combined_text_for_regen)
@@ -1724,6 +2007,7 @@ def main():
                                     )
                                     st.session_state['results'] = new_results
                                     clear_pdf_view()
+                                regen_banner_placeholder.empty()
                                 st.success(f"Analysis regenerated under the same Analysis ID: `{analysis_id}`")
                                 st.rerun()
                             except Exception as e:
@@ -1738,6 +2022,8 @@ def main():
         with _bordered_container():
             st.markdown('<div class="section-header-bar">Go/No-Go Decision Dashboard</div>', unsafe_allow_html=True)
             render_go_no_go_dashboard(results.get('go_no_go', {}), theme)
+
+        render_ai_quality_banner(results.get('_agent_meta', {}), theme)
 
         with _bordered_container():
             st.markdown('<div class="section-header-bar">Project Summary</div>', unsafe_allow_html=True)
@@ -1886,6 +2172,11 @@ def main():
                                 uploaded_file.seek(0)
                                 existing_pdf_bytes[uploaded_file.name] = uploaded_file.read()
 
+                        add_banner_placeholder = st.empty()
+                        with add_banner_placeholder.container():
+                            render_active_processing_banner(
+                                f"Working — adding {len(additional_files)} file(s) and re-analyzing...", theme
+                            )
                         with st.spinner(f"Processing {len(additional_files)} new file(s) and re-analyzing the combined RFP..."):
                             for idx, file_path in enumerate(add_file_paths):
                                 text = processor.extract_text(file_path)
@@ -1917,6 +2208,7 @@ def main():
                             st.session_state['pdf_raw_pages'] = existing_raw_pages
                             clear_pdf_view()
 
+                        add_banner_placeholder.empty()
                         st.success(
                             f"Analysis updated with {len(additional_files)} new file(s) "
                             f"under the same Analysis ID: `{analysis_id}`"
