@@ -7,25 +7,7 @@
 
 ---
 
-### 👥 Contributors
 
-This project is built and maintained by:
-
-<p align="left">
-  <a href="https://github.com/Yaqoob-hassan" target="_blank">
-    <img src="https://img.shields.io/badge/Muhammad%20Yaqoob%20Hassan-181717?style=for-the-badge&logo=github&logoColor=white" />
-  </a>
-  <a href="https://github.com/MominaAsim-dev" target="_blank">
-    <img src="https://img.shields.io/badge/Momina%20Asim-181717?style=for-the-badge&logo=github&logoColor=white" />
-  </a>
-  <a href="https://github.com/NimraAkhlaq" target="_blank">
-    <img src="https://img.shields.io/badge/Nimra%20Akhlaq-181717?style=for-the-badge&logo=github&logoColor=white" />
-  </a>
-</p>
-
-> Click either badge above to visit that contributor's GitHub profile.
-
-> **Note:** Only the [`RFP_Team_Project`](./RFP_Team_Project) folder in this repository is the joint work of the whole team. Other folders in this repo belong to individual work and are not part of this collaboration.
 
 ---
 
